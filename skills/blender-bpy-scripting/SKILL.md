@@ -73,6 +73,16 @@ scene.render.use_auto_generate_texture_cache = True
 # 10) 다른 머신에서 돌릴 때 첫 순서 — 환경 지문 + 정규화 기준점
 #    blender -b --factory-startup -noaudio -P scripts/bk_env.py -- --bench
 #    → references/17-environment-baseline.md
+
+# 11) ★ 시간을 한 번만 재고 결론 내리지 마라 — 최소 3회, median 과 spread 를 본다
+#     "1회 측정은 다른 작업의 그림자다." 실측 중 실제로 한 카드(5060 Ti)가
+#     7.21 s → 4.14 → 2.68 s 로 3배 갈렸다. 첫 값은 남의 잔여 부하였다.
+import time, statistics
+ts = []
+for _ in range(3):
+    t0 = time.time(); bpy.ops.render.render(write_still=True); ts.append(time.time()-t0)
+print(f"median={statistics.median(ts):.2f}s spread={(max(ts)-min(ts))/statistics.median(ts)*100:.0f}%")
+#    → references/17-environment-baseline.md §4.2
 ```
 
 그리고 — **예외를 던져도 Blender의 종료 코드는 0이다.** CI가 조용히 성공한다.
@@ -350,6 +360,9 @@ BUILD → CHECK → RENDER → MEASURE → (개선) → CHECK → ...
 - 엔진 / 샘플 수 / 해상도
 - 씬 검증 결과
 - 이미지 판정 결과와 `mean_luma`
+- **GPU 를 썼다면 GPU 개수와 `bk doctor` 의 카드 상태** (점유 상태 그대로 보고한다)
+- **렌더 시간은 3회 반복 median 으로** (1회 측정값을 그대로 넘기지 않는다 → §7.5)
+- **이 수치를 옮겨 쓸 거라면 `bk_env --bench` 배율** (→ §7.5)
 
 ---
 
@@ -795,14 +808,63 @@ blender -b -P scripts/bk.py -- doctor
   `bk doctor` 의 AMD 표를 눈으로 확인하라. (NVIDIA 쪽은 `82:00` 으로 정확)
 - **oneAPI / Metal** — 하드웨어 없음.
 - **NVLink 공유 메모리** — 이 머신엔 NVLink 이 없다. (그래서 멀티 GPU 가 느렸다)
-- `kernel_optimization_level` 실제 시간차.
+- **CUDA 백엔드** (OptiX 아닌 경로) — 이 머신엔 OptiX 만 있다.
+- **실제 VRAM 스필 시간 페널티** — 3,250만 정점 + 4K + `texture_limit=512`
+  에서도 스필이 재현되지 않았다. 매뉴얼은 "CPU 보다 느릴 수 있다" 고만 한다.
+- **클라우드 GPU** (AWS/GCP 등) — 이 머신은 로컬. PCIe 성능이 다를 수 있다.
+- **고품질(256spp+)에서의 `use_light_tree`** — 64spp 에서 무효과였다.
 - 드라이버 `use_scripts_auto_execute`: GUI 설정이라 헤드리스에서
   실제 식 평가까지는 확인 못 함. API 존재는 확인.
 - **Fluid / Ocean / Rigid Body**: API 와 속성 이름은 확인했지만,
   캐시를 포함한 "결과가 맞는지"까지는 1회 실행으로 검증하지 않음.
 
 > **성능 수치(5.69 s, 4.51 s, −25%) 는 이 머신 + 이 씬 한정이다.**
-> 절대 스케일로 옮기지 말 것. 다른 머신에서는 `bk doctor` 로 상태를 보고
-> 직접 재라. 상세는 [`references/14-gpu-rendering.md`](references/14-gpu-rendering.md) §12.
+> 절대 스케일로 옮기지 말 것. 상세는
+> [`references/14-gpu-rendering.md`](references/14-gpu-rendering.md) §12.
+
+---
+
+## 7.5 ⭐ 이 문서의 모든 시간을 신뢰하는 법 (3가지)
+
+이 스킬의 수치는 **실측**이지만, 그대로 옮기면 안 된다. 반드시:
+
+**① 다른 머신이면 배율로 환산하라**
+
+```bash
+blender -b --factory-startup -noaudio -P scripts/bk_env.py -- --bench
+```
+기준값 `warm 0.68 s` 와 비교해 배율을 구한다. 1.8배 이상 벗어나면
+`bk_env` 가 경고를 낸다 — 환경이 바뀐 것이므로 원인을 먼저 찾을 것.
+→ [`references/17-environment-baseline.md`](references/17-environment-baseline.md)
+
+**② 시간을 한 번만 재지 마라**
+
+```python
+ts = []
+for _ in range(3):
+    t0 = time.time(); bpy.ops.render.render(write_still=True); ts.append(time.time()-t0)
+print(f"median={statistics.median(ts):.2f}s "
+      f"spread={(max(ts)-min(ts))/statistics.median(ts)*100:.0f}%")
+```
+
+이 스킬을 만들면서 실제로 겪은 일: RTX 5060 Ti 가 **7.21 s → 4.14 → 2.68 s**
+로 3배 갈렸다. 첫 값은 다른 작업의 잔여 부하였다.
+**같은 설정·같은 머신에서 spread 27%** 를 본 적도 있다.
+→ §4.2
+
+**③ 렌더 전에 카드 상태를 확인하라**
+
+GPU 상태는 **테스트 도중 바뀐다.** 이 스킬을 만들면서 같은 머신에서
+`bench` 가 0.68 s → 2.43 s → 0.74 s 로 변했다.
+여유 VRAM 이 줄어들면 `enable_gpu` 가 다른 카드로 갈아타고, 프레임당
+시간이 **+949%** 까지 뛸 수 있다 (2K 60fps 실측, §2.5).
+
+```bash
+blender -b -P scripts/bk.py -- doctor    # [BUSY] 표시 확인
+```
+
+**부하 없는 상태에서 측려야 비교가 된다.** GPU 연산량이 늘면 최적화
+비율도 옅어진다 — 반대로 **부하가 있어도 `persistent_data`·디노이즈
+절감률은 유지된다**(BVH 재구성 비용이라서).
 
 이 항목들은 문서에 "미검증"으로 표시되어 있다. 신뢰하지 말고 직접 재현할 것.
