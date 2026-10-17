@@ -149,13 +149,50 @@ def cmd_doctor(args):
         print("  조회 실패:", rep["error"])
     else:
         print("  컴파일된 백엔드 :", {k: v for k, v in rep["compiled"].items() if v})
-        print("  감지된 GPU      :", rep["devices"] or "없음")
         print("  감지 수(백엔드별):", rep["detected"])
-        print("  활성 GPU 수     :", rep["num_gpu"], " has_device:", rep["has_device"])
         print("  선택 백엔드     :", rep["backend"] or "NONE (CPU 로 렌더)")
         print("  빌드 기능       :", rep["features"])
         print("  주의: compiled=True 는 '하드웨어가 있다'가 아니라 "
               "'백엔드가 빌드에 포함됐다' 는 뜻")
+        print()
+        print("  === GPU별 실측 상태 (nvidia-smi) ===")
+        usage = rep.get("host_usage") or {}
+        if not usage:
+            print("  호스트 정보 없음 (nvidia-smi 없음 / 비-NVIDIA)")
+        chosen = rep.get("backend")
+        for bus, h in sorted(usage.items(), key=lambda kv: -kv[1]["free_mb"]):
+            devs = [d for d in rep["devices"] if d["bus_id"] == bus and d["backend"] == chosen]
+            tag = ", ".join(sorted({d["name"] for d in devs})) or "(선택 백엔드 아님)"
+            ok = h["free_mb"] >= compat.MIN_FREE_VRAM_MB
+            flag = "OK " if ok else "BUSY"
+            print(f"  [{flag}] gpu{h['index']:>2} {bus}  {tag:<26} "
+                  f"여유 {h['free_mb']:>6} MB / {h['total_mb']:>6} MB "
+                  f" util {h['util_pct']:>3}%")
+        print()
+        print("  === enable_gpu() 가 선택할 것 ===")
+        usable = rep.get("usable") or []
+        if not usable:
+            print("  사용 가능한 GPU 없음 -> CPU 로 폴백")
+        else:
+            best = max(usable, key=lambda d: (d.get("host") or {}).get("free_mb", 0))
+            h = best.get("host") or {}
+            print(f"  사용: {best['name']} (여유 {h.get('free_mb', '?')} MB)")
+            if len(usable) > 1:
+                print(f"  기본값은 GPU 1장만 사용. 카드 {len(usable)}장을 모두 켜면 "
+                      f"PCIe 통신 비용 때문에 오히려 느려진다 (enable_gpu 의 "
+                      f"docstring 에 실측 표 참고).")
+        amd = rep.get("host_usage_amd") or {}
+        if amd:
+            print()
+            print("  === AMD GPU 상태 (rocm-smi) ===")
+            print("  ⚠ rocm-smi 는 버스 ID 를 주지 않아 카드와 1:1 매칭이 불가능하다.")
+            print("    enable_gpu() 는 HIP 카드 점유 여부를 자동으로 걸러주지 못한다.")
+            for k in sorted(amd, key=lambda x: amd[x]["index"]):
+                a = amd[k]
+                print(f"  [{'BUSY' if a['util_pct'] and a['util_pct'] > 50 else 'OK '}] "
+                      f"gpu{a['index']} {a['name'] or '?':<26} "
+                      f"VRAM {a['used_pct']:>3}%  util {a['util_pct']:>3}%")
+        print(f"  활성 GPU 수     : {rep['num_gpu']}  has_device: {rep['has_device']}")
 
     print("=== counts ===")
     print("  bpy.ops total     ", sum(
@@ -198,6 +235,22 @@ def cmd_render(args):
     scene = bpy.context.scene
     if args.get("engine"):
         compat.set_engine(scene, args.get("engine"))
+    elif args.get("purpose"):
+        # Let bkkit pick the engine by job. Measured spread between engines is
+        # at most ~7x, but EEVEE and Cycles land on *different GPUs* on a mixed
+        # workstation -- see references/19-render-engines.md.
+        chosen = compat.set_engine_for_purpose(scene, args.get("purpose"),
+                                               samples=args.int_("samples", 64))
+        print(f"engine: {chosen['engine']} ({chosen['purpose']})"
+              + (f"  {chosen['note']}" if chosen.get("note") else ""))
+    elif args.get("engine") is None and scene.render.engine in ("BLENDER_EEVEE",
+                                                                "BLENDER_WORKBENCH"):
+        # EEVEE needs its GPU brought up in headless mode or it can fall back to
+        # a software rasteriser (~100x slower than Cycles on CPU).
+        try:
+            compat.eevee_gpu_renderer()
+        except Exception:
+            pass
     if args.get("samples"):
         if scene.render.engine == "CYCLES":
             scene.cycles.samples = args.int_("samples", 64)

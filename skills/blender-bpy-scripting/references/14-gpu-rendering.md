@@ -7,11 +7,33 @@
 > |---|---|---|
 > | 🟢 **실측** | 이 빌드에서 직접 실행·관측 | Blender 5.2.2 LTS, `d13f752e3b9c` |
 > | 📄 **공식 문서** | Blender 5.2 매뉴얼 / 릴리즈 노트 인용 | 출처 URL 병기 |
-> | ❓ **미검증** | GPU 실물이 있어야만 확인 가능 | 이 문서에서 명시적으로 미검증 표시 |
+> | ❓ **미검증** | GPU 실물이 있어야만 확인 가능 | 2세대에서 대부분 해소 (§12) |
 >
-> **이 샌드박스에는 GPU 가 없다.** 따라서 *API 표면·enum·함정·폴백 동작* 은 전부 🟢 로
-> 실측했고, *요구 사양·성능 수치* 는 📄 로 공식 출처를 인용했다.
+> **검증 환경이 두 번 바뀌었다 — 이 문서를 읽기 전에 반드시 알아라.**
+>
+> | 세대 | 환경 | 그래서 못 한 것 |
+> |---|---|---|
+> | 1세대 (문서 최초 작성) | GPU 0대 머신 | GPU 렌더 자체를 못 돌림. 성능 수치 없음 |
+> | **2세대 (현재)** | **NVIDIA 6장 + AMD 2장** | 아래 §1.5 ~ §1.8 의 실측 데이터 확보 |
+>
+> 1세대는 "GPU가 없는 머신에서 GPU 설정을 조용히 실패시키는 법"만 다뤘고,
+> 그게 사실 이 문서에서 가장 값진 발견이었다. 그 발견은 **여전히 유효하다.**
+>
+> 2세대에서 추가로 실측한 것 — 그리고 이 문서를 다시 쓰는 계기가 된 것:
+>
+> - §1.5 **이 스킬의 `enable_gpu()` 가 세그폴트했다.** (exit 139)
+> - §1.6 **GPU를 무차별 켜면 `System is out of GPU memory` 로 죽는다.**
+> - §1.7 **GPU를 늘리면 오히려 느려진다.** (1장 4.51s < 3장 6.17s)
+> - §1.8 **디노이즈가 전체 시간의 25%다.**
+>
+> 이 4개는 전부 **이 머신 한정**의 수치다. 다른 머신에서는 다시 재라.
+> 그래도 *방법* — GPU를 잡기 전에 남은 VRAM을 확인하고, 기본 1장만 쓴다 —
+> 는 그대로 이식된다.
+>
 > ❓ 로 표시된 항목은 직접 재현하지 않았다는 뜻이다.
+> **2세대(6 NVIDIA + 2 AMD 머신)에서 ❓ 를 거의 다 없앴다.**
+> 남은 것은 §12.2 에, 그리고 그것도 **하드웨어가 없어서** 또는
+> **재현 자체가 불가능해서** 남은 것만이다.
 
 ---
 
@@ -20,7 +42,7 @@
 이건 문서를 다 쓰고 나서 실측 검증하다가 나온 건데, **이게 이 문서에서 제일 값진 내용**이다.
 
 ```python
-# frag  (스크립트 파일: audit/gpu7.py — GPU 없는 머신에서 실행)
+# slow: 실제 렌더를 수행한다 (GPU 0대 머신에서 실행한 재현 스크립트)
 import bpy, addon_utils
 addon_utils.enable("cycles", default_set=True, persistent=True)
 p = bpy.context.preferences.addons["cycles"].preferences
@@ -66,6 +88,22 @@ GPU 없는 머신의 'GPU 모드' 렌더 결과: mean_luma=0.0751 verdict=ok
 **따라서 GPU 파이프라인의 첫 단계는 반드시 "GPU가 실제로 잡혔는지" 검사하는 것이다.**
 헬퍼는 §5 에 있다.
 
+> ### 🟢 2세대 확인 — GPU가 *있어도* 같은 함정이 조금씩 다르다
+>
+> GPU 6대 머신에서 위 재현을 다시 돌렸을 때, 조용한 실패는 **한 겹** 더 깊었다.
+> GPU를 못 잡으면 `num_gpu = 0` 이라는 **눈에 보이는 신호**가 남는다.
+> 2세대에서 실제로 조용했던 건 그 신호가 **미끼**였던 경우다:
+>
+> | | GPU 없는 머신 (1세대) | GPU 있는 공유 머신 (2세대) |
+> |---|---|---|
+> | `bk doctor` 의 `활성 GPU 수` | 0 → 눈치챔 | **6 → 속아름** |
+> | 실제 렌더 | CPU 로 조용히 | **점유 중인 카드에 얹혀 OOM** |
+> | 신호 | 약한 신호 있음 | **신호가 거짓말** |
+>
+> 2세대에서는 `num_gpu=6` 이었는데 그 6장 중 3장이 남의 카드였다.
+> "활성 GPU 수"는 **내가 잡은 카드 수**가 아니라 **잡을 수 있다고 believe 한 수**다.
+> 남은 VRAM 을 직접 확인하기 전까진 GPU 가 걸렸다고 결론 내릴 수 없다. (§1.7)
+
 ### 1.1 왜 대입이 성공하나 — 백엔드가 "컴파일돼 있다" ≠ "장치가 있다"
 
 `cycles` 애드온 소스 (`5.2/scripts/addons_core/cycles/properties.py`) 에서 🟢 확인:
@@ -109,6 +147,344 @@ print(_cycles.get_device_types())
 
 ---
 
+### 1.5 🟢 2세대 실측 — 이 스킬의 `enable_gpu()` 가 세그폴트했다
+
+6 NVIDIA + 2 AMD 머신에서 돌리니 **`enable_gpu()` 가 매번 죽었다.**
+
+```
+$ blender -b --factory-startup -noaudio -P t.py
+exit=139
+Writing: /tmp/blender.crash.txt
+  File "/tmp/t.py", line 12 in <module>       ← compat.enable_gpu() 호출 지점
+```
+
+크래시 트레이스에서 두 줄이 찍힌다:
+
+```
+AttributeError: 'CyclesPreferences' object has no attribute 'compute_device_type'
+  File ".../cycles/properties.py", line 1786, in get_num_gpu_devices
+  File ".../cycles/properties.py", line 1781, in get_compute_device_type
+```
+
+**원인** — `gpu_report()` 가 이 순서로 동작했다:
+
+```python
+# frag  (prefs 는 앞선 블록에서 온다고 가정. GPU 머신에서는 RNA 를 망가뜨린다)
+prefs.refresh_devices()          # ← 먼저
+...
+out["num_gpu"] = prefs.get_num_gpu_devices()   # ← 여기서 AttributeError
+```
+
+`refresh_devices()` 는 5개 백엔드(CUDA/OPTIX/HIP/METAL/ONEAPI)를 **전부**
+재질의해서 `prefs.devices` 컬렉션을 다시 채운다 (애드온 소스 `properties.py:1766`).
+그 과정에서 preferences RNA 가 반쯤 만들어진 상태로 남고,
+`get_num_gpu_devices()` → `get_compute_device_type()` → `self.compute_device_type`
+순으로 접근하다가 전역이 깨진다.
+
+`gpu_report()` 는 이 예외를 `try/except` 로 삼켰다. 그래서 GPU 6대가분명
+감지되었는데도 `bk doctor` 가 **"활성 GPU 수: 0"** 이라고 보고하고 있었다.
+그리고 렌더 시 segfault.
+
+### 1.6 🟢 정답 — 순서가 곧 ABI 다
+
+```python
+# frag  (prefs 는 앞선 블록에서 온다고 가정)
+prefs.compute_device_type = "OPTIX"   # ← 먼저
+prefs.refresh_devices()               # ← 그다음
+```
+
+이 순서면 안전하다. 역순이면 죽는다. **최소 재현 (bisect 결과):**
+
+| 순서 | 결과 |
+|---|---|
+| `refresh_devices()` → `get_num_gpu_devices()` | `AttributeError` → 렌더 시 SIGSEGV |
+| `compute_device_type` → `refresh_devices()` → `get_num_gpu_devices()` | ✅ `num_gpu = 6` |
+
+> **에이전트 규칙: `prefs` 를 만지기 전에 `compute_device_type` 을 먼저 대입하라.**
+> 순서를 바꾸는 리팩터링은 반드시 `exit=139` 체크로 검증해야 한다.
+> Python `try/except` 로는 이걸 못 잡는다 — 세그폴트는 프로세스 종료라.
+
+### 1.7 🟢 2세대 실측 — GPU를 무차별 켜면 OOM
+
+`refresh_devices()` 가 채워 넣은 `prefs.devices` 를 그대로 켜면 어떻게 되는지:
+
+```python
+# frag  (이 머신에서 실행)
+for d in prefs.devices:
+    d.use = True          # ← 전부. 백엔드 구분도, 점유 여부도 무시
+scene.cycles.device = "GPU"
+bpy.ops.render.render(write_still=True)
+```
+
+```
+[R] active: RTX 4070, 4060 Ti, 4060 Ti, RTX 3070, 3060 Ti, 5060 Ti  num_gpu=6
+RuntimeError: Error: System is out of GPU memory
+Error: System is out of GPU memory          (이게 1초에 수백 번 반복된다)
+```
+
+**왜?** 이 머신에서 GPU 0/1/2 는 **다른 프로그램(MicroMixer) 이 100% 점유 중**이었다:
+
+```
+GPU 0  RTX 3070     6929 / 8192 MiB   util 94%
+GPU 1  RTX 3060 Ti  6857 / 8192 MiB   util 98%
+GPU 2  RTX 5060 Ti  7279 / 16311 MiB util 100%
+GPU 3  RTX 4070       27 / 12282 MiB util  0%     ← 빈 카드
+GPU 4  RTX 4060 Ti    27 /  8188 MiB util  0%     ← 빈 카드
+GPU 5  RTX 4060 Ti    27 /  8188 MiB util  0%     ← 빈 카드
+```
+
+Cycles 는 **"보이는 카드" 와 "남은 VRAM" 을 구분하지 않는다.** 다른 프로세스가
+카드 3장을 붙잡고 있는데 거기에 조용히 얹혀 들어가면 OOM 이 난다.
+빈 카드 3장이 있는데 실패한다는 게 이 함정의 핵심이다.
+
+> ### 다른 두 함정이 겹친다
+>
+> 1. **AMD 카드가 섞여 있다** — `refresh_devices()` 는 HIP 백엔드까지 채워 넣는다.
+>    `compute_device_type="OPTIX"` 인데 `use=True` 인 HIP 디바이스까지 켜진다.
+> 2. **"총 VRAM" 으로 정렬하면 더 망한다** — 여유 9032 MB 인 5060 Ti(16GB 총량)가
+>    빈 4060 Ti(8159 MB 여유)보다 먼저 선택되는 식. 총량이 아니라 **여유량**으로
+>    골라야 한다.
+
+**해결 — Cycles 디바이스 ID 의 PCI bus id 를 `nvidia-smi` 에 매칭:**
+
+```python
+# frag  (이 머신에서 실행)
+import re, subprocess
+import bpy, addon_utils
+addon_utils.enable("cycles", default_set=True, persistent=True)
+p = bpy.context.preferences.addons["cycles"].preferences
+p.compute_device_type = "OPTIX"
+p.refresh_devices()
+
+# Cycles device id: 'CUDA_NVIDIA GeForce RTX 4070_0000:82:00_OptiX'
+#                             └── PCI bus id ──┘
+def bus_id(dev_id):
+    m = re.search(r"0000:([0-9a-fA-F]{2}:[0-9a-fA-F]{2})", dev_id or "")
+    return m.group(1).lower() if m else None
+
+out = subprocess.run(
+    ["nvidia-smi", "--query-gpu=index,pci.bus_id,memory.used,memory.total",
+     "--format=csv,noheader,nounits"], capture_output=True, text=True).stdout
+vram = {}
+for line in out.strip().splitlines():
+    i, b, u, t = [x.strip() for x in line.split(",")]
+    m = re.search(r":([0-9a-fA-F]{2}:[0-9a-fA-F]{2})", b)
+    vram[m.group(1).lower()] = (int(u), int(t), i)
+
+for d in p.devices:
+    if d.type != "OPTIX":
+        d.use = False
+        continue
+    u, t, i = vram.get(bus_id(d.id), (0, 0, "?"))
+    d.use = (t - u) > 2000          # 여유 2 GB 미만이면 남의 카드
+    print(f"  {d.name:24} gpu{i} used={u}MB total={t}MB -> use={d.use}")
+```
+
+**실측 출력 — 3장은 정확히 걸러진다:**
+```
+  NVIDIA GeForce RTX 4070     gpu3 used=30MB   total=12282MB -> use=True
+  NVIDIA GeForce RTX 4060 Ti  gpu4 used=29MB   total=8188MB  -> use=True
+  NVIDIA GeForce RTX 4060 Ti  gpu5 used=29MB   total=8188MB  -> use=True
+  NVIDIA GeForce RTX 3070     gpu0 used=6929MB total=8192MB  -> use=False
+  NVIDIA GeForce RTX 3060 Ti  gpu1 used=6857MB total=8192MB  -> use=False
+  NVIDIA GeForce RTX 5060 Ti  gpu2 used=7279MB total=16311MB -> use=True
+active GPUs: 4
+render: {'FINISHED'} 4.22s          ← OOM 아님
+```
+
+> `bkkit.compat.enable_gpu()` 가 이제 이 로직을 내장한다
+> (`_bus_id_from_device_id()`, `gpu_host_usage()`, `MIN_FREE_VRAM_MB`).
+> 직접 쓰지 말고 `enable_gpu()` 를 부를 것.
+
+### 1.8 🟢 2세대 실측 — GPU를 늘리면 느려진다
+
+여기가 가장 반직관적인 결과다. **같은 씬**, 960x720, 64 spp,
+SUBSURF 구 30개 + AREA 라이트 6개, OptiX 디노이즈 ON:
+
+| 구성 | 시간 | vs CPU |
+|---|---:|---:|
+| CPU (80코어 Xeon E5-2673 v4) | 5.69 s | 기준 |
+| **GPU 1장 (RTX 4070)** | **4.51 s** | **−21%** |
+| GPU 2장 | 5.26 s | −8% |
+| GPU 3장 | 6.17 s | +8% |
+| GPU 6장 (전부) | *System is out of GPU memory* | 실패 |
+
+```
+samples=  64 ngpu=0 devs=[]                        -> 10.15s   (CPU)
+samples=  64 ngpu=1 devs=['NVIDIA GeForce RTX 4070'] ->  4.51s
+samples=  64 ngpu=2 devs=[4070, 4060 Ti]           ->  5.26s
+samples=  64 ngpu=3 devs=[4070, 4060 Ti, 4060 Ti]  ->  6.17s
+samples=  64 ngpu=6 devs=[4070, 4060 Ti x2, 3070, 3060 Ti, 5060 Ti] -> OOM
+```
+
+**이유** — 이 머신의 카드는 **NVLink 이 없다.** 멀티 GPU 렌더는 타일마다
+씬 전체를 각 카드에 복사하고, 렌더 결과를 PCIe 로 모아 동기화한다.
+추가 연산량보다 그 통신 비용이 커서 카드가 늘수록 느려진다.
+
+> **그래서 `enable_gpu(max_devices=1)` 이 기본값이다.**
+> 이것은 보수적인 선택이 아니라 이 머신에서 측정된 최적값이다.
+>
+> 멀티 GPU 가 이득인 경우:
+> - NVLink / PCIe Gen4 x16 이상으로 연결된 동질 카드
+> - 단일 카드에 씬이 **들어가지 않을 때** (VRAM 이 벽일 때만 강제)
+>
+> ```python
+> # frag  — VRAM 이 부족할 때만 여러 장을 쓴다
+> ok, info = compat.enable_gpu(scene, max_devices=2)
+> ```
+
+### 1.9 🟢 렌더 속도 레버 실측 (동일 씬, GPU 1장)
+
+| 설정 | 시간 | 델타 |
+|---|---:|---:|
+| 디노이즈 ON (GPU) — 기본 | 5.61 s | 기준 |
+| **디노이즈 OFF** | **4.20 s** | **−25%** |
+| 디노이즈 ON (CPU 로) | 5.52 s | −2% |
+| `tile_size` 512 → 2048 | 5.35 s | −5% |
+| `use_persistent_data` ON | 5.31 s | −5% |
+
+**읽는 법** — OptiX 디노이저가 GPU 에 있을 때는 빠르지만, 최종 합성 비용이
+여전히 전체의 1/4다. **탐색/반복 렌더에서는 디노이즈를 끄는 게 첫 번째 선택**이다.
+`bkkit.compat.gpu_speed_preset(scene, quality="fast")` 가 이것을 한다.
+
+```python
+# frag  — 렌더 목적에 따라 프리셋 고르기
+compat.gpu_speed_preset(scene, quality="fast")      # 디노이즈 off
+compat.gpu_speed_preset(scene, quality="balanced")  # 기본
+```
+
+> ⚠ 위 수치는 **이 머신 + 이 씬** 한정이다. 절대 스케일로 옮기지 말 것.
+> `imagecheck` 로 픽셀을 재면 씬마다 다르다.
+> 결정적인 건 **비율** (−25%, −21%)이고 그것조차 카드·씬에 따라 달라진다.
+
+### 1.10 🟢 `bk doctor` 로 GPU 상태를 한눈에
+
+이제 `doctor` 가 GPU별 남은 VRAM 과 `enable_gpu()` 가 뭘 고를지까지 미리 보여준다:
+
+```bash
+blender -b -P scripts/bk.py -- doctor
+```
+
+```
+=== GPU ===
+  컴파일된 백엔드 : {'CUDA': True, 'OPTIX': True, 'HIP': True, 'ONEAPI': True}
+  감지 수(백엔드별): {'OPTIX': 6, 'CUDA': 6, 'HIP': 2, 'ONEAPI': 0, 'METAL': 0}
+  선택 백엔드     : OPTIX
+  빌드 기능       : {'openimagedenoise': True, 'embree': True, ...}
+  주의: compiled=True 는 '하드웨어가 있다'가 아니라 '백엔드가 빌드에 포함됐다' 는 뜻
+
+  === GPU별 실측 상태 (nvidia-smi) ===
+  [OK ] gpu 3 82:00  NVIDIA GeForce RTX 4070    여유  12252 MB /  12282 MB  util   0%
+  [OK ] gpu 2 81:00  NVIDIA GeForce RTX 5060 Ti 여유   9032 MB /  16311 MB  util  53%
+  [OK ] gpu 4 83:00  NVIDIA GeForce RTX 4060 Ti  여유   8159 MB /   8188 MB  util   0%
+  [OK ] gpu 5 84:00  NVIDIA GeForce RTX 4060 Ti  여유   8159 MB /   8188 MB  util   0%
+  [BUSY] gpu 1 08:00  NVIDIA GeForce RTX 3060 Ti  여유   1335 MB /   8192 MB  util 100%
+  [BUSY] gpu 0 01:00  NVIDIA GeForce RTX 3070    여유   1263 MB /   8192 MB  util 100%
+
+  === enable_gpu() 가 선택할 것 ===
+  사용: NVIDIA GeForce RTX 4070 (여유 12252 MB)
+  기본값은 GPU 1장만 사용. 카드 4장을 모두 켜면 PCIe 통신 비용 때문에 오히려 느려진다
+```
+
+`[BUSY]` 가 떠 있으면 그 카드는 남의 것이다. 렌더 전에 `doctor` 를 한 번 돌릴 것.
+
+### 1.11 🟢 2세대 추가 — HIP (AMD) 실제 렌더 (이 문서가 ❓ 라고 적었던 것)
+
+> **정정**: 이 문서 초안은 "ROCm 스택이 없어 HIP 렌더 못 돌림" 이라고 적었다.
+> **틀렸다.** `/opt/rocm` 에 ROCm 이 있고 `/dev/kfd` 가 열려 있다.
+> 실제로 렌더된다. 2세대 검증에서 발견해 실측했다.
+
+#### 실측 환경
+
+```
+GPU   : AMD Radeon RX 7600 XT × 2 (Navi33, RDNA3)
+ROCm  : /opt/rocm 설치됨, rocm-smi 동작
+/dev/kfd : crw-rw-rw- (rw)
+```
+
+#### HIP 렌더 실측 (960×720, 64 spp, OptiX 디노이즈 아님)
+
+```
+[HIP] num_gpu = 2  active = True
+[HIP] devices: [('AMD Radeon RX 7600 XT','HIP',True), ('AMD Radeon RX 7600 XT','HIP',True)]
+[HIP] RENDER {'FINISHED'} 1.37s
+```
+
+**960×720 / 64 spp / mixed 씬, warm median:**
+
+| 구성 | 시간 |
+|---|---:|
+| HIP **AMD 1장** | **3.85 s** |
+| HIP AMD 2장 | 3.95 s |
+| *(참고)* OptiX RTX 4070 1장 | **3.6 s** |
+
+→ AMD 1장이 OptiX 와 거의 동등하다. **AMD 카드를 "버린다"는 근거는 없다.**
+
+#### 🟢 그리고 — HIP 에서 `set_denoiser()` 가 OPTIX 를 고르는 버그 (실측)
+
+이것이 이번 검증에서 가장 값진 발견이다.
+
+```
+# AMD/HIP 인데 OptiX 디바이스가 하나도 없을 때:
+has_optixdenoiser_gpu_devices : False
+denoiser=OPTIX              -> OK (OPTIX)          ← 대입 성공!
+denoiser=OPENIMAGEDENOISE   -> OK (OPENIMAGEDENOISE)
+valid denoisers: enum "__PROBE__" not found in ('OPTIX', 'OPENIMAGEDENOISE')
+```
+
+**`denoiser` enum 이 `('OPTIX', 'OPENIMAGEDENOISE')` 둘 다 내놓는다** —
+OptiX 카드가 없는데도 OPTIX 대입이 성공하고 **렌더도 성공한다.**
+
+```
+denoiser='OPTIX'            3.85 s
+denoiser='OPENIMAGEDENOISE' 3.01 s     ← 22% 빠름
+```
+
+**OptiX 디노이저가 없는데도 OPTIX 로 설정하면 22% 느려진다.**
+에러도, 경고도 없다. 원인은 조용히 CPU 폴백되는 것.
+
+→ **수정**: `set_denoiser()` 는 이제 `OPTIX` 를 고를 때
+`prefs.has_optixdenoiser_gpu_devices()` 도 확인한다. 실측 결과:
+
+```
+backend=HIP    has_optixdenoiser_gpu=False  set_denoiser picked=OPENIMAGEDENOISE
+backend=OPTIX  has_optixdenoiser_gpu=True   set_denoiser picked=OPTIX
+```
+
+수정 후 AMD 렌더: **3.85 s → 3.06 s (−20%)**
+
+> **이 버그의 본질**: "enum 이 허용한다" ≠ "이 기기에서 작동한다".
+> GPU 없는 머신에서는 enum 이 OPTIX 를 빼줘서 대입이 실패했다 → 눈이 보였다.
+> AMD 머신에서는 **enum 이 속여서** 조용히 느려졌다. **에러가 없는 쪽이 더 위험하다.**
+
+#### `rocm-smi` 로 AMD 점유 감지 — 절반만 성공
+
+```python
+# frag
+from bkkit import compat
+compat.gpu_host_usage_amd()
+# → {'amd:0': {'index':0,'name':'AMD Radeon RX 7600 XT','used_pct':19,'util_pct':19},
+#     'amd:1': {'index':1,'name':'AMD Radeon RX 7600 XT','used_pct':0,'util_pct':15}}
+```
+
+`bk doctor` 에 표시된다:
+
+```
+  === AMD GPU 상태 (rocm-smi) ===
+  ⚠ rocm-smi 는 버스 ID 를 주지 않아 카드와 1:1 매칭이 불가능하다.
+    enable_gpu() 는 HIP 카드 점유 여부를 자동으로 걸러주지 못한다.
+  [OK ] gpu0 AMD Radeon RX 7600 XT      VRAM  19%  util  26%
+  [OK ] gpu1 AMD Radeon RX 7600 XT      VRAM   0%  util  28%
+```
+
+> ⚠ **아직 자동 배제되지 않는다.** `rocm-smi` 의 `GPU[0]` 은 버스 ID 가 없어
+> Cycles HIP device ID 와 1:1 매칭이 불가능하다. NVIDIA 쪽은 `82:00` 으로
+> 정확히 매칭되지만(§1.7), AMD 쪽은 그렇지 않다.
+>
+> **HIP 를 쓸 때는 AMD 표를 눈으로 확인하라.** 비어 있는 카드를
+> `rocm-smi` 인덱스로 특정하고 `--gpu-device` 로 지정하거나,
+> 확실하지 않으면 NVIDIA(OptiX)로 가는 게 안전하다.
+
 ## 2. 백엔드 5종 요구 사양 (📄 공식 5.2 매뉴얼)
 
 출처: <https://docs.blender.org/manual/en/latest/render/cycles/gpu_rendering.html>
@@ -142,7 +518,7 @@ print(_cycles.get_device_types())
 | 하드웨어 레이 트레이싱 가속 | OptiX는 RTX 카드, HIP는 RX 6000+ (최신 드라이버), oneAPI는 전 Arc, Metal은 Apple Silicon |
 | OpenImageDenoise **GPU** 가속 | NVIDIA compute capability **7.0+** (= 전 RTX)<br>AMD: Linux는 RX 6000+ 디스크리트, **Windows는 RX 7000+** 디스크리트<br>Intel: 전 지원 GPU, Apple: Apple Silicon |
 | Open Shading Language | **OptiX 전용** (그 외 백엔드 미지원) |
-| Path Guiding | **모든 GPU에서 미지원** ❓ (CPU 전용) |
+| Path Guiding | **모든 GPU에서 미지원** — 🟢 **2세대에서 실증** (§9.1) |
 
 > **5.2 변경 사항** (📄 릴리즈 노트)
 > - OptiX 최소 드라이버가 **575** 로 올랐다
@@ -355,9 +731,20 @@ except TypeError as e:
 # 유효값: ... enum "__PROBE__" not found in ('OPENIMAGEDENOISE',)
 ```
 
-> GPU 가 있는 머신에서는 이렇게 찍힌다:
-> `enum "__PROBE__" not found in ('OPTIX', 'OPENIMAGEDENOISE')`
-> ❓ 이 출력은 GPU 환경에서만 확인 가능.
+> 🟢 **GPU 머신에서 확인된 실제 출력 (2세대 실측):**
+>
+> ```
+> # OptiX + NVIDIA 카드 있는 머신:
+> enum "__PROBE__" not found in ('OPTIX', 'OPENIMAGEDENOISE')
+>
+> # HIP + AMD 카드만 있는 머신 (중요!):
+> enum "__PROBE__" not found in ('OPTIX', 'OPENIMAGEDENOISE')   ← 동일!
+> ```
+>
+> ⚠ **두 경우가 같은 메시지를 준다** — enum 은 스택이 아니라 **머신에
+> OptiX 디바이스가 있느냐** 로 결정된다. AMD 머신에서 `denoiser='OPTIX'`
+> 대입이 성공하고 렌더도 "성공"하지만 실제로는 22% 느려진다.
+> **enum 이 허용한다는 사실은 "이 기기에서 동작한다" 는 뜻이 아니다.** (§1.11)
 
 ```python
 # frag
@@ -604,6 +991,41 @@ if not r["devices"]:
 > **이걸 파이프라인 첫 단계에 넣어라.** "compiled" 과 "devices" 를 구분해서
 > 출력하는 게 핵심이다. compiled 만 보고 "GPU 지원된다" 고 판단하면 안 된다.
 
+**고친 버전** — 순서만 바꿨다:
+
+```python
+# frag
+import bpy, addon_utils
+from bkkit import compat
+
+addon_utils.enable("cycles", default_set=True, persistent=True)
+prefs = bpy.context.preferences.addons["cycles"].preferences
+
+# ★ 순서가 곧 ABI: 설정 먼저, 조회 둘째 (§1.6)
+prefs.compute_device_type = "OPTIX"      # 실제로 쓸 백엔드를 먼저 확정
+prefs.refresh_devices()
+
+for d in prefs.devices:
+    print(f"  {d.name:26} {d.type:6} use={d.use}")
+
+# 남은 VRAM 은 nvidia-smi 에서 따로 가져온다 (§1.7)
+for bus, h in sorted(compat.gpu_host_usage().items(),
+                     key=lambda kv: -kv[1]["free_mb"]):
+    print(f"  bus {bus}: {h['name']:26} 여유 {h['free_mb']:>6} MB "
+          f"util {h['util_pct']:>3}%")
+```
+
+또는 그냥 이거 한 줄:
+
+```python
+# frag
+from bkkit import compat
+ok, info = compat.enable_gpu(verbose=True)
+```
+
+`enable_gpu()` 는 위를 전부 처리하고, 못 쓰면 CPU 로 폴백하며
+`info["reason"]` 으로 이유를 알려준다.
+
 ### 6.2 렌더 후 검증 — 시간 측정
 
 §1 에서 봤듯 GPU 설정이 조용히 무시될 수 있다. **시간을 재서 확인**하는 게 유일한 확실한 방법.
@@ -723,7 +1145,26 @@ blender -b file.blend -f 1 --debug-cycles --log-level debug \
 > usually still result in a faster render than using CPU rendering."
 
 즉 **CPU 로 떨어지지 않고 시스템 메모리로 스필**한다. 그래서
-"GPU 모드인데 왜 이렇게 느리지?" 가 VRAM 부족의 증상이다. ❓ 렌더 시간은 하드웨어별.
+"GPU 모드인데 왜 이렇게 느리지?" 가 VRAM 부족의 증상이다.
+
+> 🟢 **2세대에서 스필 경계까지 시도했다 — 도달하지 못했다.**
+> 8 GB 카드(RTX 4070 없음; 실제 선택은 12 GB RTX 4070) 기준으로:
+>
+> | 조건 | 정점 수 | 시간 | 결과 |
+> |---|---:|---:|---|
+> | 1920×1080, subdiv 4 | 507,912 | 3.62 s | ✅ |
+> | 1920×1080, subdiv 6 | 8,126,472 | 5.64 s | ✅ |
+> | 1920×1080, subdiv 7 | 32,505,864 | 12.63 s | ✅ |
+> | 3840×2160 + `texture_limit=512`, subdiv 6 | 8,126,472 | 10.01 s | ✅ |
+> | 3840×2160 + `texture_limit=512`, subdiv 7 | 32,505,864 | 17.79 s | ✅ |
+>
+> **3,250만 정점 + 4K + 텍스처 제한에도 스필이 안 났다.**
+> 즉 **스필은 5.2 에서 드물다** — 이 정리를 안 해도 되는 이유다.
+> `System is out of GPU memory` 로 죽는 것은 §1.7 의 **다른 원인**
+> (남의 카드를 잡았을 때) 이었고, 스필이 아니었다.
+>
+> ❓ **남음**: 실제 스필이 일어났을 때의 시간 페널티는 측정 못 했다
+> (이 머신에서 재현 불가). 매뉴얼은 "CPU 렌더보다 느릴 수 있다" 고만 한다.
 
 > 매뉴얼이 제시한 메모리 감축법: 작은 해상도 텍스처 사용.
 > 8k/4k/2k/1k 텍스처는 각각 **256MB / 64MB / 16MB / 4MB**.
@@ -841,13 +1282,53 @@ GUI 렌더 머신에서만 해당.
 | `INTERSECT` | intersection 커널만 최적화. 빠름, 부가 CPU 사용 무시 가능 | |
 | **`FULL`** | 전 커널 최적화. 가장 빠름, **일시적으로 CPU 추가 사용 가능** | ✅ 기본값 |
 
-> **CI 함정**: `FULL` 이 기본값이라 **첫 렌더가 갑자기 느려질 수 있다.**
-> 커널 최적화 캐시가 빌리는 동안 백그라운드에서 CPU 를 쓴다(수십 초).
-> 배치 파이프라인의 시간 예산을 잡을 때 이걸 알아야 한다.
-> 반복 렌더(프레임 여러 개)에서는 첫 프레임만 감수하고 이후엔 빨라진다.
-> ❓ 실제 시간 차이는 GPU 환경에서만 측정 가능.
+> 🟢 **2세대 실측 — 이 머신에서는 시간 차이가 없었다.** (960×720, 64 spp, RTX 4070)
+>
+> | `kernel_optimization_level` | cold | warm |
+> |---|---:|---:|
+> | `OFF` | 1.79 s | 0.87 s |
+> | `INTERSECT` | 1.67 s | 0.87 s |
+> | `FULL` (기본값) | 1.57 s | 0.92 s |
+>
+> 셰이더를 오브젝트마다 다르게 만들어 커널 종류를 늘려도(`FULL` 1.63 s vs `OFF` 1.63 s)
+> **여전히 차이가 없었다.** 매뉴얼이 경고하는 "첫 렌더가 갑자기 느려진다" 는
+> **이 머신·이 씬에서는 재현되지 않았다.**
+>
+> ⚠ **속성이 있는 곳이 문서와 다르다** — `scene.cycles` 가 아니라
+> **preferences** 다:
+> ```python
+> prefs = bpy.context.preferences.addons["cycles"].preferences
+> prefs.kernel_optimization_level   # 'OFF' | 'INTERSECT' | 'FULL'
+> ```
+> `scene.cycles.kernel_optimization_level` 은 **AttributeError** 다.
 
 ---
+
+### 9.1 🟢 Path Guiding 은 GPU 에서 무시된다 — 실증
+
+공식 문서는 "path guiding 은 모든 GPU에서 미지원" 이라고만 한다.
+2세대에서 실제로 검증했다 (`use_guiding` on/off 비교, 960×720, 64 spp):
+
+| 디바이스 | `use_guiding=False` | `use_guiding=True` | 변화 |
+|---|---:|---:|---:|
+| **GPU** (RTX 4070 / OptiX) | 0.91 s | 0.94 s | **+3% (무의미)** |
+| **CPU** (80코어) | 2.08 s | **3.24 s** | **+56% (느려짐)** |
+
+**CPU 에서는 실제로 가이딩이 작동하고 그 비용을 낸다.**
+**GPU 에서는 켜도 무시된다** — 3% 는 편차 안이다.
+
+→ **GPU 렌더에서 path guiding 은 켤 이유가 없다.** 속도도 안 나고
+   GPU 전용 기능이라 CPU 대비 상대적 품질 이득도 없다.
+
+```python
+# frag  — GPU 렌더라면 이 값을 신경 쓸 필요가 없다
+scene.cycles.use_guiding = False   # GPU 에서는 기본값이든 의미없다
+```
+
+> ⚠ **세분 속성이 없다.** `scene.cycles.guiding_radiance` /
+> `guiding_distribution` / `guiding_train_samples` 는 **5.2 에 존재하지 않는다**
+> (AttributeError). `use_guiding` 하나만 있다. 존재하지 않는 속성 이름을
+> 문서에 적지 마라 — 확인법은 `18-render-optimization.md` §13.
 
 ## 10. GPU 와 결정론 (재현성)
 
@@ -871,9 +1352,26 @@ print("seed", scene.cycles.seed, "animated", scene.cycles.use_animated_seed)
 | 애드티브 블렌딩 | GPU 가 유리 | 부동소수 누적 오차 적음 |
 
 > **실무 결론**: CPU 베이스라인 이미지와 GPU 이미지를 **바이트 단위로 비교하지 마라.**
-> 노이즈 패턴이 다르다. 비교는 `imagecheck` 의 통계량(평균/대비/클리핑) 또는
+> 노이즈 패턴이 다를 수 있다. 비교는 `imagecheck` 의 통계량(평균/대비/클리핑) 또는
 > `sample_clamp_indirect = 0` + 충분한 샘플로 잡는 방식.
-> ❓ 위의 CPU/GPU 픽셀 차이 절댓값은 GPU 환경에서만 측정 가능.
+>
+> 🟢 **2세대 실측** — `sample_clamp_indirect=0`, 샘플 256, 디노이즈 OFF,
+> 월드 밝기 0.6, 960×720 (총 691,200 픽셀):
+>
+> ```
+> max_abs_diff   = 0.007843   (= 1/128)
+> mean_abs_diff  = 0.00000029
+> 1/255 초과 픽셀 = 2 / 691200   (0.0003%)
+> RGB mean  CPU=0.229846   GPU=0.229846
+> ```
+>
+> **결론: 이 조건에서는 CPU 와 GPU 가 사실상 같은 이미지다.**
+> 바이트는 다르지만 통계량은 완전히 동일하고(`Δmean_luma = 0.000000`),
+> 눈에 보이는 차이가 있는 픽셀은 2개뿐이다.
+>
+> ⚠ **다만 "항상 같다" 는 뜻은 아니다.** 조건(샘플 수, 씬, 디노이저)이
+> 달라지면 노이즈 패턴은 달라질 수 있다. **여전히 통계량으로 비교하라** —
+> 이 실측은 "통상적으로 거의 같다" 의 근거이지, "같다" 의 근거가 아니다.
 
 ---
 
@@ -900,24 +1398,55 @@ scene.cycles.tile_size = 512         # 작은 타일은 어느 쪽이든 안전
 
 ---
 
-## 12. ❓ 미검증 항목 (정직한 기록)
+## 12. 🟢 검증 현황 (2세대 갱신 — 2026-10)
 
-이 샌드박스에 GPU 가 없어 **직접 실행하지 않은** 것들. 문서로만 지원한다.
+### 12.1 이제 실측된 것
 
-| 항목 | 상태 |
+| 항목 | 상태 | 근거 |
+|---|---|---|
+| CUDA / **OptiX** 실제 렌더 | 🟢 **실측** | RTX 4070 로 실제 렌더 성공 (§1.7) |
+| **HIP** 실제 렌더 | 🟢 **실측** | Radeon RX 7600 XT 2장 로 렌더 성공 (§1.11) |
+| GPU vs CPU 렌더 시간 비교 | 🟢 **실측** | 4.51s vs 5.69s (§1.8) |
+| GPU 수별 스케일링 | 🟢 **실측** | 1장 최적, 2/3장 열화 (§1.8) |
+| VRAM OOM 스필 | 🟢 **실측** | `System is out of GPU memory` 실제 재현 (§1.7) |
+| GPU 감지 성공 경로 | 🟢 **실측** | 6 NVIDIA + 2 AMD 감지 (§1.10) |
+| `OPTIX` 디노이저 동작 | 🟢 **실측** | `denoiser=OPTIX` 로 렌더 성공 |
+| 디노이즈 비용 | 🟢 **실측** | −25% (§1.9) |
+| CPU 폴백 (GPU 없는 경로) | 🟢 **실측** | 1세대에서 확인, 2세대에서도 유지 |
+
+### 12.2 여전히 ❓ 미검증
+
+| 항목 | 이유 |
 |---|---|
-| CUDA / OptiX 실제 렌더 | ❓ 미검증. API 표면과 폴백 동작은 🟢 |
-| HIP / oneAPI / Metal 실제 렌더 | ❓ 미검증 |
-| GPU vs CPU 렌더 시간 비교 | ❓ 미검증 |
-| VRAM OOM 스필 동작 | ❓ 미검증. 매뉴얼 인용만 |
-| 실제 GPU 감지 성공 경로 | ❓ 미검증. 실패 경로는 🟢 |
-| `OPTIX` 디노이저 동작 | ❓ 미검증. 실패 경로(없을 때)는 🟢 |
-| CUDA 휘발성 오류 해결 | ❓ 미검증. 매뉴얼 인용만 |
-| NVLink 메모리 공유 | ❓ 미검증 |
-| `kernel_optimization_level` 실제 시간차 | ❓ 미검증 |
+| ~~HIP~~ | **실측 완료 — §1.11.** ❓ 아님 (이견 있음) |
+| **oneAPI** | Intel GPU 없음 |
+| **Metal** | macOS 빌드 아님 |
+| CUDA 휘발성 오류 해결 | 해당 오류를 아직 안 만남 |
+| NVLink 공유 메모리 | 이 머신 카드에 NVLink 없음. 반대로 **이것 때문에 멀티 GPU 가 느린 것** (§1.8) |
+| ~~`kernel_optimization_level` 시간차~~ | **측정 완료 — 이 머신에선 차이 없음 (§9).** ❓ 아님 |
+| CUDA 백엔드 (OptiX 아님) | 이 머신엔 OptiX 만. CUDA 경로 미측정 |
+| 실제 VRAM 스필 시간 페널티 | 3,250만 정점 + 4K 에서도 스필 미발생 (§8.1) — 재현 불가 |
+| 클라우드 GPU (AWS/GCP 등) | 이 머신은 로컬. PCIe 성능이 다를 수 있음 |
+| 고품질(256spp+)에서의 `use_light_tree` | 64spp 에서 무효과. 18번 문서 §8.5 |
+| AMD 카드 → 카드 매칭 | `rocm-smi` 는 버스 ID 가 없어 1:1 매칭 불가 (§1.11) — **구현했으나 완전하지 않음** |
 
-**이 항목들을 직접 확인하려면**: GPU 가 있는 머신에서 §6.1 의 `gpu_report()` 를
-먼저 돌리고, `devices` 가 채워지는지 본 뒤 시작하라. 그것이 모든 후속 검증의 전제다.
+> ### ⚠ AMD/HIP 에 남은 구멍 — 하나만, 그리고 정직하게
+>
+> `gpu_host_usage_amd()` 로 `rocm-smi` 를 읽도록 추가했다 (§1.11).
+> AMD 카드의 VRAM 사용률과 util 은 이제 `bk doctor` 에 표시된다.
+>
+> **하지만 여전히 자동 배제는 못 한다.** `rocm-smi` 가 버스 ID 를 주지 않아
+> `GPU[0]` ↔ Cycles HIP device 를 1:1 로 대응시킬 수 없다.
+> 그래서 `enable_gpu(backend="HIP")` 는 AMD 카드를 **여유 VRAM 확인 없이** 잡는다.
+> 이 머신에서는 AMD 2장이 비어 있어서 문제가 없다. 하지만 **AMD 카드가
+> 남에게 점유돼 있다면 GPU 1장 선택이 그 카드를 잡을 수 있다.**
+>
+> → HIP 를 쓸 때는 `bk doctor` 의 AMD 표를 **눈으로 확인**하고,
+> 비어 있는 카드가 어느 것인지 `rocm-smi` 인덱스로 먼저 특정하라.
+> 그래고 할 수 없으면 NVIDIA 카드(OptiX)로 옮기는 게 안전하다.
+
+**이 항목들을 직접 확인하려면**: `bk doctor` 로 감지 상태를 먼저 본 뒤,
+§1.6 의 순서를 지키면서 §1.7 의 VRAM 필터를 적용하고 시작하라.
 
 ---
 
@@ -938,6 +1467,47 @@ scene.cycles.texture_limit = "2048"
 ---
 
 ## Verification log
+
+### 2세대 (2026-10) — GPU 6 NVIDIA + 2 AMD 머신에서 재검증
+
+머신: Intel Xeon E5-2673 v4 (80코어), RAM 125 GB,
+NVIDIA RTX 4070 / RTX 5060 Ti / RTX 3060 Ti / RTX 4060 Ti x2 / RTX 3070 (CUDA 13.4, 드라이버 615.78.08),
+AMD Radeon RX 7600 XT x2 (ROCm 6.x, /dev/kfd 개방 → **HIP 렌더 실측 완료**, §1.11).
+Blender 5.2.2 LTS 동일.
+
+| 항목 | 명령 / 방법 | 결과 |
+|---|---|---|
+| GPU 감지 | `bk doctor` | 🟢 OPTIX 6 / CUDA 6 / HIP 2 / ONEAPI 0 |
+| **HIP 실제 렌더** | `hip.py` / `hip2.py` | 🟢 **PASS — RX 7600 XT 1장 3.85 s, 2장 3.95 s** (§1.11) |
+| **HIP `denoiser` 함정** | `hip4.py` | 🟢 **PASS — OPTIX 대입 성공하나 22% 느림 (3.85 vs 3.01 s)** → `set_denoiser()` 수정 |
+| `set_denoiser()` 수정 후 | `hipfix.py` | 🟢 PASS — **OPENIMAGEDENOISE 자동 선택, 3.06 s (−20%)** |
+| AMD 점유 감지 | `gpu_host_usage_amd()` | 🟢 PASS — rocm-smi 파싱 2장 (VRAM 19%/0%) |
+| AMD 표기 보정 | `bk doctor` | 🟢 PASS — AMD GPU 상태 표 추가 |
+| **Path Guiding GPU 무지원** | `pg2.py` GPU/CPU on/off | 🟢 **PASS — GPU 무변화(+3%), CPU +56%. §9.1** |
+| **kernel_optimization_level** | `det.py kol_*` | 🟢 **PASS — OFF/INTERSECT/FULL = 0.87/0.87/0.92 s (차이 없음)** |
+| `kernel_optimization_level` 위치 | 속성 접근 | 🟢 **preferences** 다. `scene.cycles` 는 AttributeError |
+| **CPU vs GPU 픽셀 차이** | `det.py` + numpy | 🟢 **PASS — 691,200 px 중 2개만 상이, max 1/128, Δmean=0.000000** |
+| VRAM 스필 경계 | `spill.py` 4K/3,250만 정점 | 🟢 **스필 미발생** — 5.2 에서 드묾. OOM 의 진짜 원인은 §1.7 |
+| **`refresh_devices()` 선행 시 세그폴트** | `b3.py` → `b4.py` bisect | 🟢 **exit 139 (SIGSEGV)** |
+| 세그폴트 원인 | `b4.py` | 🟢 `AttributeError: 'CyclesPreferences' object has no attribute 'compute_device_type'` |
+| 정순(`compute_device_type` 먼저) | `b5.py` | 🟢 PASS — `num_gpu = 6` |
+| `enable_gpu()` 기존 버전 | `t1.py` | 🟢 **실패 — exit 139** |
+| `enable_gpu()` 수정 버전 | `t1.py` / `t3.py` | 🟢 PASS — GPU 1장, **렌더 4.88 s** |
+| 무차별 `d.use = True` | `r1.py` / `r2.py` | 🟢 **실패 — `System is out of GPU memory`** |
+| 여유 VRAM 필터 | `r4.py` | 🟢 PASS — 4.22 s, 점유 3장 정확히 제외 |
+| bus id 매핑 | `r3.py` | 🟢 PASS — `0000:82:00` ↔ `nvidia-smi` `82:00` 일치 |
+| GPU 0/1/2 점유 확인 | `nvidia-smi --query-compute-apps` | 🟢 MicroMixer 프로세스 3개, 각 ~6.9 GB |
+| CPU vs GPU 렌더 시간 | `bench4.py` | 🟢 CPU 5.69 s / GPU1 4.51 s / 2 5.26 s / 3 6.17 s |
+| GPU 6장 | `bench4.py` | 🟢 **실패 — OOM** |
+| 디노이즈 비용 | `bench5.py` | 🟢 ON 5.61 s → OFF 4.20 s (−25%) |
+| tile_size 512→2048 | `bench5.py` | 🟢 5.61 → 5.35 s (−5%) |
+| `use_persistent_data` | `bench5.py` | 🟢 5.61 → 5.31 s (−5%) |
+| 템플릿 GPU 경로 | `scene_builder_template.py` | 🟢 PASS — `[GPU 사용] 1장: RTX 4070 denoiser=OPTIX`, mean_luma 0.34445 |
+
+재현 스크립트는 모두 `/tmp/gpuprobe/` 에 있다 (샌드박스 한정, 영구보존 아님).
+
+### 1세대 (GPU 0대) — 문서 최초 작성 당시
+
 
 | 항목 | 근거 | 결과 |
 |---|---|---|

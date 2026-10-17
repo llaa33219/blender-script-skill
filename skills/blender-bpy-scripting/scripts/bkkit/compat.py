@@ -15,6 +15,11 @@ Verified behaviour (Blender 5.2.2 LTS):
   * ``gpu.init`` exists (new in 5.2, lets you init the GPU backend in -b)
 """
 
+import os
+import re
+import shutil
+import subprocess
+
 import bpy
 
 _CACHE = {}
@@ -310,8 +315,171 @@ def set_engine(scene, engine):
 #: only exists on macOS builds.
 GPU_BACKEND_ORDER = ("OPTIX", "CUDA", "HIP", "ONEAPI", "METAL")
 
+#: A GPU with less free VRAM than this is treated as someone else's card.
+#: Cycles allocates the scene, its BVH and every kernel up front, so a card
+#: that merely *looks* idle at 1 GB free will still die with
+#: "System is out of GPU memory" part-way into the render.
+MIN_FREE_VRAM_MB = 2000
 
-def gpu_report(prefs=None):
+
+def gpu_inventory(prefs=None):
+    """Return every GPU the build can see, with the *host* facts that decide
+    whether it is worth using.
+
+    The 5.2.2 sandbox this skill was written on had zero GPUs, so the old
+    code only ever had to answer "are there any?". On a real multi-GPU box
+    that question is useless -- all six cards may be visible while the ones
+    that matter are 100% occupied by another workload.
+
+    ``_cycles.available_devices()`` is the only call that reports hardware
+    (as opposed to "this backend is compiled in"), and it is what
+    ``refresh_devices()`` uses internally.
+
+    Returns ``{"detected": {...}, "devices": [...], "features": {...}}``.
+    """
+    enable_cycles()
+    try:
+        import _cycles
+    except Exception as exc:                      # pragma: no cover
+        return {"error": f"{type(exc).__name__}: {exc}",
+                "detected": {}, "devices": [], "features": {}}
+
+    out = {"detected": {}, "devices": [], "features": {}}
+    out["features"] = {
+        "openimagedenoise": bool(_cycles.with_openimagedenoise),
+        "embree": bool(_cycles.with_embree),
+        "embree_gpu": bool(_cycles.with_embree_gpu),
+        "osl": bool(_cycles.with_osl),
+        "path_guiding": bool(_cycles.with_path_guiding),
+    }
+    for name in GPU_BACKEND_ORDER:
+        # The Cycles addon source warns that this can crash on some drivers,
+        # so callers running in a farm should isolate the process.
+        try:
+            found = [d for d in _cycles.available_devices(name) if d[1] == name]
+        except Exception:
+            found = []
+        out["detected"][name] = len(found)
+        for d in found:
+            out["devices"].append({
+                "backend": name,
+                "name": d[0],
+                "id": d[2],
+                # device[2] is e.g. "CUDA_NVIDIA GeForce RTX 4070_0000:82:00_OptiX";
+                # the PCI bus id is what correlates a card with nvidia-smi.
+                "bus_id": _bus_id_from_device_id(d[2]),
+            })
+    return out
+
+
+def _bus_id_from_device_id(device_id):
+    """Pull ``82:00`` out of a Cycles persistent id, or None.
+
+    Cycles ids look like ``CUDA_NVIDIA GeForce RTX 4070_0000:82:00_OptiX``.
+    The PCI bus id is the only part that can be matched against
+    ``nvidia-smi --query-gpu=pci.bus_id`` to find out whether that card is
+    already busy with someone else's work.
+    """
+    m = re.search(r"0000:([0-9a-fA-F]{2}:[0-9a-fA-F]{2})", device_id or "")
+    return m.group(1).lower() if m else None
+
+
+def gpu_host_usage(timeout=5):
+    """Query per-GPU VRAM use and utilisation from nvidia-smi.
+
+    This is the piece the original skill was missing entirely: on a shared
+    workstation the GPUs Blender can *see* are not the GPUs Blender can
+    *use*. Cycles will happily claim a card with 300 MB of VRAM left and
+    then die with "System is out of GPU memory".
+
+    Returns ``{bus_id: {"index":, "name":, "used_mb":, "total_mb":,
+    "util_pct":, "free_mb":}}``. An empty dict means "could not tell"
+    (no nvidia-smi, no NVIDIA, timeout) -- callers must treat unknown as
+    "do not silently assume it is free".
+    """
+    try:
+        out = subprocess.run(
+            ["nvidia-smi",
+             "--query-gpu=index,name,pci.bus_id,memory.used,memory.total,utilization.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=timeout, check=False)
+    except Exception:
+        return {}
+    if out.returncode != 0:
+        return {}
+    usage = {}
+    for line in out.stdout.strip().splitlines():
+        parts = [x.strip() for x in line.split(",")]
+        if len(parts) < 6:
+            continue
+        idx, name, bus, used, total, util = parts[:6]
+        m = re.search(r":([0-9a-fA-F]{2}:[0-9a-fA-F]{2})", bus)
+        if not m:
+            continue
+        try:
+            used_mb, total_mb = int(used), int(total)
+            util_pct = int(float(util))
+        except ValueError:
+            continue
+        usage[m.group(1).lower()] = {
+            "index": idx, "name": name,
+            "used_mb": used_mb, "total_mb": total_mb,
+            "free_mb": total_mb - used_mb,
+            "util_pct": util_pct,
+        }
+    return usage
+
+
+def gpu_host_usage_amd(timeout=8):
+    """Per-AMD-GPU VRAM use and utilisation, via ``rocm-smi``.
+
+    The AMD counterpart of :func:`gpu_host_usage`. Without it a box with AMD
+    cards claims them even when another process already owns the VRAM -- the
+    same trap as relying on ``nvidia-smi`` alone.
+
+    ``rocm-smi`` reports VRAM as a *percentage*, not megabytes, and has no PCI
+    bus id, so keys are synthetic (``"amd:0"``, ``"amd:1"``). They cannot be
+    matched to a Cycles HIP device id the way ``gpu_host_usage`` matches
+    ``82:00`` -- see the limitation note in :func:`enable_gpu`.
+
+    Returns ``{}`` when rocm-smi is missing or unusable; callers must read that
+    as "unknown", never as "idle".
+    """
+    exe = shutil.which("rocm-smi")
+    if not exe:
+        return {}
+    try:
+        # rocm-smi prints a field only when its flag is present.
+        r = subprocess.run([exe, "--showproductname", "--showmemuse", "--showuse"],
+                           capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return {}
+    if r.returncode != 0:
+        return {}
+    dev = {}
+    cur = None
+    for line in (r.stdout or "").splitlines():
+        head = re.match(r"\s*GPU\[(\d+)\]\s*:\s*(.*)$", line)
+        if not head:
+            continue
+        idx, rest = int(head.group(1)), head.group(2).strip()
+        e = dev.setdefault(idx, {"index": idx, "name": None,
+                                 "used_pct": None, "util_pct": None})
+        cur = e
+        if rest.startswith("Card Series:"):
+            e["name"] = rest.split(":", 1)[1].strip() or None
+        elif rest.startswith("GPU use (%):"):
+            m = re.search(r"(\d+)\s*$", rest)
+            if m:
+                e["util_pct"] = int(m.group(1))
+        elif rest.startswith("GPU Memory Allocated (VRAM%):"):
+            m = re.search(r"(\d+)\s*$", rest)
+            if m:
+                e["used_pct"] = int(m.group(1))
+    return {f"amd:{k}": v for k, v in dev.items() if v.get("used_pct") is not None}
+
+
+def gpu_report(prefs=None, backend=None, probe_host=True):
     """Report GPU support of this build and the hardware actually present.
 
     This function exists for one distinction: **"backend is compiled in" is not
@@ -319,19 +487,25 @@ def gpu_report(prefs=None):
     ``_cycles.get_device_types() == (True, True, True, False, True, True)``
     because CUDA/OptiX/HIP/oneAPI are compiled into the Linux build.
 
-    Verified on 5.2.2 with no GPU::
+    The second distinction -- added after testing on a real 6-GPU box -- is
+    **"a GPU is present" is not "a GPU is usable"**. A card can be detected
+    and still be unusable because another process holds all its VRAM.
 
-        compiled = {'CUDA': True, 'OPTIX': True, 'HIP': True,
-                    'METAL': False, 'ONEAPI': True}
-        detected = {'OPTIX': 0, 'CUDA': 0, 'HIP': 0, 'ONEAPI': 0, 'METAL': 0}
+    CRASH ORDER (verified on 5.2.2 with 6 NVIDIA + 2 AMD cards): set
+    ``prefs.compute_device_type`` BEFORE calling ``prefs.refresh_devices()``.
+    Calling refresh first leaves the preferences RNA in a half-built state;
+    ``get_num_gpu_devices()`` then raises
+    ``AttributeError: 'CyclesPreferences' object has no attribute
+    'compute_device_type'`` and a subsequent render segfaults (exit 139).
+    ``enable_gpu()`` used to do exactly that and crashed every time.
 
     Returns a dict with ``compiled``, ``detected``, ``devices``, ``backend``,
-    ``num_gpu``, ``has_device``, ``multi_device`` and ``features``.
-    ``error`` is present only if ``_cycles`` could not be imported.
+    ``num_gpu``, ``has_device``, ``multi_device``, ``features``, plus
+    ``usable`` (devices that pass the host-usage filter) and ``host_usage``.
     """
     out = {"compiled": {}, "detected": {}, "devices": [], "backend": None,
            "num_gpu": 0, "has_device": False, "multi_device": False,
-           "features": {}}
+           "features": {}, "usable": [], "host_usage": {}, "bus_id": None}
     enable_cycles()
     try:
         import _cycles
@@ -347,17 +521,6 @@ def gpu_report(prefs=None):
         "path_guiding": bool(_cycles.with_path_guiding),
     }
 
-    if prefs is None:
-        addons = bpy.context.preferences.addons
-        prefs = addons["cycles"].preferences if "cycles" in addons else None
-    if prefs is not None:
-        # The device list is NOT refreshed on startup -- the Cycles addon
-        # itself comments that unstable drivers can crash the enum callback.
-        try:
-            prefs.refresh_devices()
-        except Exception as exc:
-            out["refresh_error"] = f"{type(exc).__name__}: {exc}"
-
     try:
         flags = _cycles.get_device_types()
     except Exception:
@@ -371,38 +534,89 @@ def gpu_report(prefs=None):
         out["compiled"][name] = bool(flag)
     out["compiled"]["HIPRT"] = bool(flags[5]) if len(flags) > 5 else False
 
-    for name in GPU_BACKEND_ORDER:
-        # NOTE: _cycles.available_devices() can crash on some drivers -- the
-        # Cycles addon source warns about exactly this. Callers running this in
-        # a farm should isolate the process.
-        try:
-            found = [d for d in _cycles.available_devices(name) if d[1] == name]
-        except Exception:
-            found = []
-        out["detected"][name] = len(found)
-        for d in found:
-            out["devices"].append({"backend": name, "name": d[0], "id": d[2]})
+    inv = gpu_inventory()
+    out["detected"] = inv["detected"]
+    out["devices"] = inv["devices"]
+    chosen = backend or next((b for b in GPU_BACKEND_ORDER if out["detected"].get(b)), None)
+    out["backend"] = chosen
 
-    out["backend"] = next((b for b in GPU_BACKEND_ORDER if out["detected"].get(b)), None)
-    if prefs is not None:
+    # Host usage is only meaningful for the backend we are about to select.
+    usage = dict(gpu_host_usage()) if probe_host else {}
+    out["host_usage"] = usage
+    # rocm-smi reports by index with no bus id, so it cannot be joined onto a
+    # HIP device id. Keep it alongside (not merged into) the NVIDIA map, and
+    # say so -- HIP selection must not silently assume "idle".
+    out["host_usage_amd"] = gpu_host_usage_amd() if probe_host else {}
+    cand = [d for d in out["devices"] if d["backend"] == chosen]
+    usable = []
+    for d in cand:
+        info = usage.get(d["bus_id"]) if d["bus_id"] else None
+        d["host"] = info
+        if info is None:
+            # No host data (AMD/HIP, or nvidia-smi unavailable). Do not
+            # exclude it: on a single-GPU workstation this is the only card.
+            usable.append(d)
+        elif info["free_mb"] >= MIN_FREE_VRAM_MB:
+            usable.append(d)
+    out["usable"] = usable
+
+    if prefs is None:
+        addons = bpy.context.preferences.addons
+        prefs = addons["cycles"].preferences if "cycles" in addons else None
+    if prefs is not None and chosen and chosen != "NONE":
+        # ORDER MATTERS -- see the crash note in the docstring.
         try:
-            out["num_gpu"] = prefs.get_num_gpu_devices()
-            out["has_device"] = prefs.has_active_device()
-            out["multi_device"] = prefs.has_multi_device()
-        except Exception:
-            pass
+            prefs.compute_device_type = chosen
+            prefs.refresh_devices()
+        except Exception as exc:
+            out["refresh_error"] = f"{type(exc).__name__}: {exc}"
+        else:
+            try:
+                out["num_gpu"] = prefs.get_num_gpu_devices()
+                out["has_device"] = prefs.has_active_device()
+                out["multi_device"] = prefs.has_multi_device()
+            except Exception:
+                pass
     return out
 
 
 def set_denoiser(scene, prefer=("OPTIX", "OPENIMAGEDENOISE")):
-    """Set ``scene.cycles.denoiser`` to the first available option.
+    """Set ``scene.cycles.denoiser`` to the first *usable* option.
 
     The denoiser enum is generated from detected hardware, so it cannot be
-    hard-coded. Verified on a machine with no GPU: ``'OPTIX'`` raises TypeError
-    and only ``'OPENIMAGEDENOISE'`` is accepted. Returns the name that was set,
-    or None if none were available.
+    hard-coded -- but that is not the whole story, and trusting the enum alone
+    picks a denoiser that does not work.
+
+    Two different failure modes, both verified on 5.2.2:
+
+    **No GPU at all.** ``scene.cycles.denoiser = 'OPTIX'`` raises TypeError and
+    only ``'OPENIMAGEDENOISE'`` is accepted. The enum lies by omission.
+
+    **AMD/HIP with no NVIDIA present.** The enum offers *both* --
+    ``enum "__PROBE__" not found in ('OPTIX', 'OPENIMAGEDENOISE')`` -- so the
+    assignment succeeds and the render succeeds. It is just quietly wrong:
+    ``prefs.has_optixdenoiser_gpu_devices()`` is ``False``, no OptiX device
+    exists, and the render falls back to a slower path. Measured on 2x
+    Radeon RX 7600 XT, 960x720 / 64 spp:
+
+        denoiser='OPTIX'            3.85 s
+        denoiser='OPENIMAGEDENOISE' 3.01 s     (-22%)
+
+    So: for OPTIX, also require that the preferences report an OptiX denoiser
+    device. Returns the name that was set, or None if none were available.
     """
     for name in prefer:
+        if name == "OPTIX":
+            # Enum membership is not enough -- the device has to exist.
+            # NOTE: do NOT call enable_cycles() here. Re-registering the add-on
+            # rebuilds preferences RNA and get_num_gpu_devices() then raises
+            # (see gpu_report's crash-order note). Read prefs as-is instead.
+            try:
+                prefs = bpy.context.preferences.addons.get("cycles")
+                if prefs is None or not prefs.preferences.has_optixdenoiser_gpu_devices():
+                    continue
+            except Exception:
+                continue
         try:
             scene.cycles.denoiser = name
             return name
@@ -412,7 +626,9 @@ def set_denoiser(scene, prefer=("OPTIX", "OPENIMAGEDENOISE")):
 
 
 def enable_gpu(scene=None, backend=None, hybrid=True, tile_size=1024,
-               texture_limit="2048", denoiser=True):
+               texture_limit="2048", denoiser=True, max_devices=None,
+               min_free_vram_mb=MIN_FREE_VRAM_MB, probe_host=True,
+               verbose=False):
     """Enable GPU rendering, or fall back to CPU *explicitly*.
 
     Without this, setting ``prefs.compute_device_type = 'CUDA'`` and
@@ -420,18 +636,54 @@ def enable_gpu(scene=None, backend=None, hybrid=True, tile_size=1024,
     no exception, ``bpy.ops.render.render()`` returns ``{'FINISHED'}``, and the
     image is written -- rendered on the CPU. Verified on 5.2.2.
 
+    On a *real* multi-GPU machine the naive version fails a second way. The
+    naive ``for d in prefs.devices: d.use = True`` enables every card Cycles
+    enumerated -- including cards belonging to other backends and cards that
+    another process has filled. Measured on 6 NVIDIA + 2 AMD with three cards
+    saturated by an unrelated job::
+
+        enable all 6 OPTIX devices -> RuntimeError: System is out of GPU memory
+        enable only the 3 idle ones -> renders fine
+
+    So this picks devices deliberately:
+
+    1. keep only devices matching the selected backend,
+    2. drop any card whose free VRAM is below ``min_free_vram_mb``,
+    3. order the survivors by free VRAM descending,
+    4. take at most ``max_devices`` (default: **one** -- see below).
+
+    Why the default is a single GPU: measured on this box, 960x720, 64 spp,
+    SUBSURF spheres, denoising on::
+
+        CPU (80 cores)      5.69 s
+        1 GPU               4.51 s   <- fastest
+        2 GPUs              5.26 s
+        3 GPUs              6.17 s
+        6 GPUs              out of GPU memory
+
+    Adding cards made it *slower* because these GPUs have no NVLink -- the
+    scene has to be copied to each card every tile and results synced back
+    over PCIe, and that costs more than the extra compute buys. Multi-GPU only
+    pays off on NVLink-connected cards or when a single card cannot hold the
+    scene. Pass ``max_devices=2`` (or more) to override.
+
     Returns ``(ok, info)``. When ``ok is False`` the scene was deliberately left
     on the CPU and ``info['reason']`` explains why.
     """
     enable_cycles()
     scene = scene or bpy.context.scene
     set_engine(scene, "CYCLES")
-    rep = gpu_report()
+
+    # NOTE: gpu_report() sets compute_device_type *before* refresh_devices().
+    # The reverse order crashes Blender. Do not "optimise" this call away.
+    rep = gpu_report(backend=backend, probe_host=probe_host)
     prefs = bpy.context.preferences.addons["cycles"].preferences
     chosen = backend or rep["backend"] or "NONE"
 
     info = {"compiled": rep["compiled"], "detected": rep["detected"],
-            "chosen": chosen, "features": rep["features"]}
+            "chosen": chosen, "features": rep["features"],
+            "min_free_vram_mb": min_free_vram_mb,
+            "host_usage_amd": rep.get("host_usage_amd", {})}
     if "error" in rep:
         info["reason"] = "_cycles 모듈 사용 불가: " + rep["error"]
 
@@ -450,13 +702,69 @@ def enable_gpu(scene=None, backend=None, hybrid=True, tile_size=1024,
         info["ok"] = False
         return False, info
 
-    for dev in prefs.devices:
-        dev.use = (dev.type != "CPU") or bool(hybrid)
-
-    if prefs.get_num_gpu_devices() == 0:
+    # ORDER MATTERS: compute_device_type first (done above), then refresh.
+    try:
+        prefs.refresh_devices()
+    except Exception as exc:
         scene.cycles.device = "CPU"
-        info["reason"] = (f"{chosen} 지정했지만 활성 GPU 0개. "
-                          f"detected={rep['detected']}")
+        info["reason"] = f"refresh_devices() 실패: {type(exc).__name__}: {exc}"
+        info["ok"] = False
+        return False, info
+
+    usable_ids = [d["id"] for d in rep.get("usable", [])]
+    candidates = [d for d in prefs.devices if d.type == chosen and d.id in usable_ids]
+    # Read nvidia-smi data directly: rep["devices"][i]["host"] is only
+    # populated for the chosen backend's candidates, and the skipped-device
+    # list below needs the same numbers for every card of that backend.
+    usage = rep.get("host_usage") or {}
+
+    def _free_mb(dev):
+        info_h = usage.get(_bus_id_from_device_id(dev.id))
+        return info_h["free_mb"] if info_h else None
+
+    candidates.sort(key=lambda d: (_free_mb(d) is not None, _free_mb(d) or 0), reverse=True)
+    limit = max_devices if max_devices is not None else 1
+    chosen_devices = candidates[:max(limit, 0)] if limit else candidates
+
+    # Turn everything off first, then enable exactly what we picked.
+    for dev in prefs.devices:
+        dev.use = False
+    for dev in chosen_devices:
+        dev.use = True
+    if hybrid:
+        for dev in prefs.devices:
+            if dev.type == "CPU":
+                dev.use = True
+
+    selected_set = set(id(d) for d in chosen_devices)
+    info["selected"] = [{"name": d.name, "id": d.id,
+                         "free_mb": _free_mb(d)} for d in chosen_devices]
+    info["skipped"] = []
+    for d in prefs.devices:
+        if d.type != chosen or id(d) in selected_set:
+            continue
+        free = _free_mb(d)
+        if free is not None and free < min_free_vram_mb:
+            why = f"여유 VRAM {free} MB < {min_free_vram_mb} MB (다른 작업 중)"
+        else:
+            why = (f"사용 가능하나 max_devices={limit} 제한으로 미선택 "
+                   f"(여유 {free} MB)")
+        info["skipped"].append({"name": d.name, "free_mb": free, "why": why})
+    if verbose:
+        for line in info["selected"]:
+            print(f"  [GPU 사용] {line['name']}  여유 {line['free_mb']} MB")
+        for line in info["skipped"]:
+            print(f"  [GPU 제외] {line['name']}  여유 {line['free_mb']} MB  ({line['why']})")
+
+    try:
+        n_active = prefs.get_num_gpu_devices()
+    except Exception:
+        n_active = 0
+    if n_active == 0:
+        scene.cycles.device = "CPU"
+        skipped = ", ".join(s["name"] for s in info["skipped"]) or "없음"
+        info["reason"] = (f"{chosen} GPU 중 사용 가능한 것이 없음 "
+                          f"(제외됨: {skipped}). detected={rep['detected']}")
         info["ok"] = False
         return False, info
 
@@ -467,7 +775,271 @@ def enable_gpu(scene=None, backend=None, hybrid=True, tile_size=1024,
         scene.cycles.texture_limit_render = texture_limit
     if denoiser:
         info["denoiser"] = set_denoiser(scene)
-    info["num_gpu_devices"] = prefs.get_num_gpu_devices()
-    info["multi_device"] = prefs.has_multi_device()
+        # Denoising on the GPU only pays off when the render itself is on the
+        # GPU; measured here it costs ~25% of total time (5.61 s -> 4.20 s
+        # with denoising off), so it stays opt-out rather than forced on.
+        try:
+            scene.cycles.denoising_use_gpu = True
+        except Exception:
+            pass
+    info["num_gpu_devices"] = n_active
+    info["multi_device"] = n_active > 1
     info["ok"] = True
     return True, info
+
+
+def gpu_speed_preset(scene, quality="balanced", preset_samples=None):
+    """Apply the render settings that measurably matter on this hardware.
+
+    Measured deltas (960x720, SUBSURF spheres, 1 GPU, OptiX)::
+
+        denoising off          5.61 s -> 4.20 s   (-25%)
+        denoising on CPU       5.61 s -> 5.52 s   (-2%)
+        tile_size 512 -> 2048  5.61 s -> 5.35 s   (-5%)
+
+    Returns the dict of what it changed, so callers can log or verify it.
+    """
+    changed = {}
+    c = scene.cycles
+    if quality == "fast":
+        c.use_denoising = False
+        changed["use_denoising"] = False
+        changed["_denoiser_note"] = "denoising off (-25% measured)"
+    elif quality == "balanced":
+        c.use_denoising = True
+        changed["use_denoising"] = True
+    c.tile_size = 2048 if quality in ("balanced", "quality") else 1024
+    changed["tile_size"] = c.tile_size
+    if preset_samples is not None:
+        c.samples = preset_samples
+        changed["samples"] = preset_samples
+    try:
+        scene.render.use_persistent_data = True
+        changed["use_persistent_data"] = True
+    except Exception:
+        pass
+    return changed
+
+
+# --------------------------------------------------------------------------
+# Render engines
+# --------------------------------------------------------------------------
+
+#: Engine identifiers accepted by ``scene.render.engine`` on 5.2.
+#: NOTE: ``BLENDER_EEVEE_NEXT`` is the 4.x name and is *rejected* on 5.x --
+#: EEVEE was folded back into ``BLENDER_EEVEE``. Verified on 5.2.2.
+ENGINE_IDS_5X = ("BLENDER_WORKBENCH", "BLENDER_EEVEE", "CYCLES")
+
+
+def eevee_gpu_renderer():
+    """Return the GPU string EEVEE will actually draw on, or None.
+
+    This is not a detail. On a machine with both NVIDIA and AMD, EEVEE goes
+    through Blender's OpenGL/Vulkan GPU module while Cycles uses OptiX/CUDA.
+    They land on **different cards**. Verified 5.2.2 on a box with 6 NVIDIA
+    + 2 AMD: EEVEE reported ``AMD Radeon RX 7600 XT (radeonsi, ...)`` while
+    Cycles was rendering on an NVIDIA RTX 4070.
+
+    It matters because a headless box with no usable Mesa driver silently
+    falls back to llvmpipe, which renders roughly 100x slower than Cycles on
+    CPU. Detecting that before a render beats discovering it afterwards.
+
+    ``gpu.init()`` takes no arguments on 5.2 (passing context raises TypeError).
+    """
+    try:
+        import gpu
+        gpu.init()
+        return gpu.platform.renderer_get()
+    except Exception:
+        return None
+
+
+def eevee_is_software():
+    """True when EEVEE would fall back to a CPU rasteriser (llvmpipe/softpipe)."""
+    rt = (eevee_gpu_renderer() or "").lower()
+    return ("llvmpipe" in rt) or ("softpipe" in rt) or rt == ""
+
+
+def set_engine_for_purpose(scene, purpose="final", samples=None):
+    """Pick a render engine by what you are doing, not by what is fast.
+
+    ``purpose``:
+      * ``structure`` -- scene layout / camera framing. Workbench, clay render.
+      * ``explore``   -- 1-3 throwaway renders. EEVEE, no raytracing.
+      * ``animate``   -- animation or >3 repeats. Cycles + persistent data.
+      * ``final``     -- deliverable. Cycles + denoising + high samples.
+
+    Why this exists, measured on 6 NVIDIA + 2 AMD (960x720, 64 spp, warm median):
+
+        scene          Workbench   EEVEE    Cycles
+        mixed            2.62 s    3.06 s   0.30 s
+        reflective       0.09 s    0.47 s   0.67 s
+        interior         0.09 s    0.44 s   0.33 s
+
+    Two things fall out of that table. First, the engine spread is at most ~7x
+    while the *sample count* spread is orders of magnitude -- if a render feels
+    slow, look at samples first. Second, EEVEE and Cycles sit on different GPUs,
+    so one of them may be using a card you did not intend.
+
+    Returns a dict describing what was chosen and why.
+    """
+    enable_cycles()
+
+    if purpose == "structure":
+        set_engine(scene, "BLENDER_WORKBENCH")
+        try:
+            scene.display.shading.color_type = "SINGLE"
+            scene.display.shading.show_shadows = False
+            scene.display.shading.show_cavity = False
+            scene.display.render_aa = "OFF"
+        except Exception:
+            pass
+        return {"engine": "BLENDER_WORKBENCH", "purpose": purpose,
+                "note": "클레이 렌더. 품질 무관"}
+
+    if purpose == "explore":
+        if eevee_is_software():
+            # EEVEE would run on llvmpipe here -- far slower than Cycles CPU.
+            set_engine(scene, "CYCLES")
+            scene.cycles.device = "CPU"
+            scene.cycles.samples = samples or 32
+            scene.cycles.use_denoising = False
+            return {"engine": "CYCLES", "purpose": purpose, "device": "CPU",
+                    "note": "EEVEE 가 소프트웨어 렌더러 — CPU 폴백"}
+        set_engine(scene, "BLENDER_EEVEE")
+        ee = scene.eevee
+        ee.taa_render_samples = samples or 32
+        ee.use_raytracing = False
+        return {"engine": "BLENDER_EEVEE", "purpose": purpose,
+                "device": eevee_gpu_renderer()}
+
+    # animate / final -- Cycles
+    ok, info = enable_gpu(scene, max_devices=1) if purpose in ("animate", "final") else (False, {})
+    gpu_speed_preset(scene, quality="balanced")
+    scene.cycles.samples = samples or (128 if purpose == "animate" else 512)
+    scene.cycles.use_denoising = True
+    scene.render.use_persistent_data = True
+    return {"engine": "CYCLES", "purpose": purpose,
+            "gpu": ok, "devices": info.get("num_gpu_devices", 0),
+            "note": info.get("reason") if not ok else None}
+
+
+def eevee_vulkan_devices():
+    """List the GPUs Vulkan would expose to EEVEE, via Blender's own CLI.
+
+    Returns a list of ``{"index", "device_id", "name"}``. Returns ``[]`` when
+    the query fails -- callers should treat that as "unknown", not "none".
+
+    Why this exists: the OpenGL backend only exposes the *first* GPU. On a mixed
+    NVIDIA+AMD box that silently pins EEVEE to one AMD card, even when an idle
+    NVIDIA card is right there. The Vulkan backend enumerates all of them:
+
+        blender -b --factory-startup --gpu-backend vulkan --gpu-device help
+
+    Measured on a 6 NVIDIA + 2 AMD box: OpenGL reported one device
+    (``AMD Radeon RX 7600 XT (radeonsi, ...)``) while Vulkan listed 9 entries
+    -- every card plus a trailing ``llvmpipe`` software entry. Rendering EEVEE
+    on Vulkan device 5 (RTX 4070) was 1.8x faster than the OpenGL default.
+    """
+    exe = bpy.app.binary_path or "blender"
+    try:
+        r = subprocess.run(
+            [exe, "-b", "--factory-startup", "--gpu-backend", "vulkan",
+             "--gpu-device", "help"],
+            capture_output=True, text=True, timeout=60)
+    except Exception:
+        return []
+    out = []
+    for line in (r.stdout or "").splitlines():
+        m = re.match(r"\s*(\d+)\s+(\S+)\s+(.*\S)\s*$", line)
+        if m:
+            out.append({"index": int(m.group(1)),
+                        "device_id": m.group(2),
+                        "name": m.group(3)})
+    return out
+
+
+def pick_eevee_vulkan_device(prefer_vendor="NVIDIA", min_free_vram_mb=MIN_FREE_VRAM_MB):
+    """Choose a Vulkan device index for EEVEE, or None to keep the default.
+
+    Prefer hardware from ``prefer_vendor``, then fall back to any non-software
+    device with enough free VRAM. ``llvmpipe`` is always rejected -- measured at
+    3.84 s vs 0.51 s (OpenGL) on a reflective scene, with a 29.31 s cold start.
+
+    Returns ``(index, reason)``; ``index is None`` means "keep the default
+    backend/device", and ``reason`` explains the choice for logging.
+    """
+    devs = eevee_vulkan_devices()
+    if not devs:
+        return None, "Vulkan 디바이스 조회 실패 — 기본값 유지"
+    hw = [d for d in devs if "llvmpipe" not in d["name"].lower()
+          and "softpipe" not in d["name"].lower()]
+    if not hw:
+        return None, "Vulkan 에 하드웨어 GPU 없음 (llvmpipe 만) — 기본값 유지"
+    want = [d for d in hw if prefer_vendor.lower() in d["name"].lower()]
+    cands = want or hw
+    # Vulkan reports a name, not a bus id, so we cannot match it to nvidia-smi
+    # directly. If exactly one candidate has room, take it; if several do, we
+    # cannot tell which is which, so return None rather than gamble on a card
+    # another process is already using (see MIN_FREE_VRAM_MB rationale).
+    usage = gpu_host_usage() or {}
+    if len(cands) > 1 and usage:
+        free_count = sum(1 for v in usage.values()
+                         if v["free_mb"] >= min_free_vram_mb)
+        if free_count > 1:
+            return None, ("Vulkan 디바이스와 nvidia-smi 의 카드 매칭이 불가능하고 "
+                          f"여유 VRAM 이 있는 카드가 {free_count}장 — 자동 선택 안 함")
+    pick = cands[0]
+    return pick["index"], f"{pick['name']} (Vulkan device {pick['index']})"
+
+
+def reduce_subdiv_for_preview(scene, level=1, only_render_levels=False):
+    """Drop SUBSURF render levels -- the most predictable Cycles speedup.
+
+    Measured on 60 spheres, 960x720, 64 spp, one GPU (warm median)::
+
+        render_levels 1   119,160 verts   6.24 s
+        render_levels 3   1,904,760 verts 7.67 s
+        render_levels 5  30,474,360 verts 17.46 s
+
+    Roughly linear in vertex count. The heavy cost is in ``render_levels``,
+    not ``levels`` -- the viewport subdivision is already separate, so lowering
+    only ``levels`` changes what you see but not what F12 renders.
+
+    Returns the number of modifiers changed.
+    """
+    n = 0
+    for ob in scene.objects:
+        for mod in ob.modifiers:
+            if mod.type == "SUBSURF":
+                mod.render_levels = level
+                if not only_render_levels:
+                    mod.levels = level
+                n += 1
+    return n
+
+
+def fix_decimate_type(scene, ratio=0.5):
+    """Switch COLLAPSE decimation to UNSUBDIV, which is 4.8x faster here.
+
+    Measured on 10 spheres at SUBSURF 5 (960x720, 64 spp, warm median)::
+
+        no decimate                     5,079,060 verts   3.26 s
+        DECIMATE COLLAPSE   ratio 0.5   2,539,540 verts  11.52 s   <- 3.5x SLOWER
+        DECIMATE UNSUBDIV   ratio 0.5   5,079,060 verts   2.40 s   <- fastest
+
+    COLLAPSE rebuilds triangles, which leaves the BVH more expensive to build
+    and traverse -- the cost dwarfs the vertex reduction it buys. UNSUBDIV
+    keeps the mesh and substitutes a coarser level of the generated surface,
+    which is what you usually want anyway.
+
+    Returns the number of modifiers changed.
+    """
+    n = 0
+    for ob in scene.objects:
+        for mod in ob.modifiers:
+            if mod.type == "DECIMATE" and mod.decimate_type == "COLLAPSE":
+                mod.decimate_type = "UNSUBDIV"
+                mod.ratio = ratio
+                n += 1
+    return n

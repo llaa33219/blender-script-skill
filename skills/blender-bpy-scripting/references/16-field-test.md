@@ -297,6 +297,441 @@ T6 이 아무것도 못 찾지 못했으면 이 테스트는 실패였을 것이
 
 ---
 
+## 2026-10 GPU/렌더링 속도 강화 — 실측 결과
+
+### 왜 다시 열었나
+
+`16-field-test.md` 원래 총평은 **7.2 / 10** 이었고, 그 원인이 여기 있었다:
+
+> **"GPU 가 없다" 고 가정하고 짜여진 스킬.** GPU 파이프라인이 필요 없다는 전제.
+
+그래서 이 스킬은 **GPU 없는 머신에서** 썼고, GPU 관련 코드는 5년 된 가정 위에
+서 있었다. GPU 6 NVIDIA + 2 AMD 머신에서 돌려보니 **코드 3개가 실제로 죽었다.**
+
+### 버그 1 — `enable_gpu()` 가 세그폴트 (exit 139)
+
+```python
+# frag  (버그 재현 발췌. prefs 는 앞선 블록에서 온다고 가정)
+prefs.refresh_devices()                      # ← 먼저
+out["num_gpu"] = prefs.get_num_gpu_devices() # AttributeError
+bpy.ops.render.render()                      # SIGSEGV
+```
+```
+AttributeError: 'CyclesPreferences' object has no attribute 'compute_device_type'
+exit=139
+```
+
+원인은 순서였다. `gpu_report()` 가 `refresh_devices()` 를 먼저 불렀고,
+그 함수가 5개 백엔드를 전부 재질의해 preferences RNA 를 반쯤 만든다.
+`try/except` 가 예외를 삼켜 **`활성 GPU 수: 0`** 이라고 잘못 보고했다
+(실제론 6대 감지). 렌더 시 segfault.
+
+→ **순서 고정**: `compute_device_type` 먼저 → `refresh_devices()` → 조회.
+bisect로 최소 재현 확인 (`b4.py` 실패 / `b5.py` 성공).
+
+### 버그 2 — 무차별 GPU 활성화 → OOM
+
+`refresh_devices()` 가 CUDA/OPTIX/**HIP까지** 전부 `use=True` 로 채운다.
+이 머신에서 GPU 0/1/2 는 MicroMixer 가 100% 점유 중이었다.
+
+```
+active: [4070, 4060 Ti, 4060 Ti, 3070, 3060 Ti, 5060 Ti]  num_gpu=6
+RuntimeError: Error: System is out of GPU memory
+```
+
+**빈 카드가 3장 더 있었는데도 죽었다.** 그리고 `bk doctor` 는
+`활성 GPU 수: 6` 이라고 했다 — **그 신호가 거짓말이었다.**
+
+→ Cycles device id (`..._0000:82:00_OptiX`) 의 PCI bus id 를 `nvidia-smi` 에
+매칭해 **여유 VRAM 2 GB 미만 카드 제외**. 실측으로 3장 정확히 걸러지고 렌더 성공.
+
+### 버그 3 — "GPU 2장 쓰면 빠르다" 는 상식의 함정
+
+960×720 · 64 spp · SUBSURF 구 30개 + AREA 라이트 6개 · OptiX 디노이즈 ON:
+
+| 구성 | 시간 |
+|---|---:|
+| CPU (80코어 Xeon E5-2673 v4) | 5.69 s |
+| **GPU 1장 (RTX 4070)** | **4.51 s** |
+| GPU 2장 | 5.26 s |
+| GPU 3장 | 6.17 s |
+| GPU 6장 | *out of GPU memory* |
+
+NVLink 없음 → PCIe 동기화 비용 > 추가 연산량. **카드가 늘수록 느려진다.**
+
+→ `enable_gpu(max_devices=1)` 이 기본값. 여러 장은 **VRAM 이 벽일 때만**.
+
+### 속도 레버 실측 (GPU 1장)
+
+| 설정 | 시간 | 델타 |
+|---|---:|---:|
+| 디노이즈 ON (기본) | 5.61 s | 기준 |
+| **디노이즈 OFF** | **4.20 s** | **−25%** |
+| 디노이즈 ON (CPU) | 5.52 s | −2% |
+| `tile_size` 512→2048 | 5.35 s | −5% |
+| `use_persistent_data` | 5.31 s | −5% |
+
+→ `gpu_speed_preset(scene, quality="fast")` 추가. 반복 렌더는 디노이즈 off.
+
+### 코드 변경
+
+| 파일 | 변경 |
+|---|---|
+| `scripts/bkkit/compat.py` | `gpu_inventory()`, `_bus_id_from_device_id()`, `gpu_host_usage()`, `gpu_report()` 재작성, `enable_gpu()` 재작성(+`max_devices`/`min_free_vram_mb`/`verbose`), `gpu_speed_preset()` 추가, `MIN_FREE_VRAM_MB` |
+| `scripts/bk.py` | `doctor` 에 GPU별 여유 VRAM/util 표 + "선택할 것" 예측 추가 |
+| `templates/scene_builder_template.py` | GPU 자동 폴백, `--cpu` / `--quality` / `--gpu-count` 플래그 |
+| `references/14-gpu-rendering.md` | §1.5~1.10 신규 (세그폴트/OOM/스케일링/속도레버), §6.1 순서 경고, §12 검증현황, vlog 2세대 |
+| `references/09-verification-loop.md` | 단계 3 GPU 정책 + "렌더 시간 측정 필수" |
+| `references/11-troubleshooting.md` | §2.9.3~2.9.6 GPU 항목 4개 |
+| `SKILL.md` | §0 요약 7번 추가, §6.5 전면 재작성, §7 검증현황 갱신 |
+
+### 재현 검증 (수정 후)
+
+```
+[T3] enable_gpu ok = True gpus = 1 denoiser = OPTIX
+[T3] RENDER OK {'FINISHED'} 4.88s          ← 이전엔 exit 139 또는 OOM
+```
+
+```
+[GPU 사용] 1장: NVIDIA GeForce RTX 4070 denoiser=OPTIX    (템플릿)
+  mean luma 0.344450 / 씬 검증 ok (errors=0 warnings=0) / 이미지 판정 ok
+```
+
+### 남은 정직한 구멍
+
+- ~~HIP 실제 렌더 미검증~~ — **실측 완료.** ❓ 아님 (ROCm 있음, 3.85 s).
+  단, **AMD 카드 → 카드 1:1 매칭은 여전히 안 된다** (`rocm-smi` 에 버스 ID 없음).
+  AMD 카드가 점유 중일 때 자동 배제되지 않으므로 `bk doctor` 표를 눈으로 봐야 한다.
+- oneAPI / Metal 미검증 (하드웨어 없음).
+- **CUDA 백엔드 미측정** (OptiX 만 실측).
+- **고품질(256spp+) `use_light_tree`** — 64spp 에서 무효과였으나 고품질은 미측정.
+- **클라우드 GPU** — 이 머신은 로컬 NVMe/NVIDIA. AWS/GPC 는 PCIe 가 다르다.
+- **실제 VRAM 스필 시간 페널티** — 5.2 에서 스필이 재현 안 돼서 측정 불가.
+- **성능 수치는 이 머신 + 이 씬 한정.** 절대 스케일로 옮기지 말 것.
+
+## 2026-10 렌더 속도 최적화 + 환경 기준선 — 실측 결과
+
+### 왜 열었나
+
+GPU 강화 뒤 남은 질문이 둘이었다:
+
+1. **다른 머신에서 이 스킬을 돌리면 시간이 얼마나 다를까?** (문서에 절대 숫자만 있었다)
+2. **GPU 를 써도 셰이더 옵션에 따라 렌더 시간이 천차만별하다**는데, 실제로 무엇이 얼마나 빠른가?
+
+둘 다 실측 없이 답할 수 없었다. 그래서 측정했다.
+
+### 추가 스크립트
+
+| 파일 | 하는 일 |
+|---|---|
+| `scripts/bk_env.py` | 환경 지문 + 정규화 기준점 (`--bench`) |
+| `references/17-environment-baseline.md` | 다른 머신에서 시간 추정하는 방법 |
+| `references/18-render-optimization.md` | 렌더 속도 최적화 (전부 실측) |
+
+### 핵심 발견
+
+**1. 영상 렌더에서 `use_persistent_data` 가 2배 차이 (과소평가된 설정)**
+
+| 8프레임 | 시간 | 프레임당 |
+|---|---:|---:|
+| 기본값 `False` | 8.25 s | 1.03 s |
+| **`True`** | **4.15 s** | **0.52 s** |
+
+**기본값이 False** 라서 아무도 안 켠다. 카메라가 움직이는 영상에서
+BVH 재구성에 프레임당 0.5 s 가 사라진다.
+
+**2. GPU 1장이 최적 — 반사 씬에서 격렬해진다**
+
+| 구성 | 4K 텍스처 씬 |
+|---|---:|
+| GPU 1장 | 1.65 s |
+| GPU 3장 | 4.48 s (**2.7배 느림**) |
+
+반사/굴절이 GPU 간 데이터 의존을 강하게 만들어 PCIe 가 병목이 된다.
+
+**3. 디노이즈 25% — 반복 렌더에서 가장 싼 절감**
+
+GPU 1장, 960×720, 64spp: ON 5.61 s → **OFF 4.20 s**
+
+**4. `texture_limit`, `max_bounces` 는 효과가 없었다 (그리고 역효과)**
+
+| 설정 | 시간 | 델타 |
+|---|---:|---:|
+| `max_bounces` 16 | 4.56 s | **−8%** (늘리는 게 빠름) |
+| `texture_limit` 4096 | 1.50 s | +15% (역효과) |
+
+**둘 다 측정 편차 안에 들거나 역효과다.** 만지지 말 것.
+
+**5. 첫 렌더는 항상 느리다 — GPU 가 더 심하다**
+
+```
+GPU 씬: first=4.74 s  warm=3.82 s  →  +24%
+CPU 씬: first=5.57 s  warm=4.98 s  →  +12%
+```
+
+GPU 커널 JIT (PTX→SASS) 비용. 반복 렌더는 **한 프로세스에서** 돌려서 1회만 냈다.
+
+**6. 같은 설정으로 재도 편차 27%**
+
+```
+times=['4.55', '3.57', '3.58', '3.61', '3.61']  median=3.61 s  spread=27.1%
+```
+
+이 머신 load(1m) 15~27. 이 편차가 **이 문서 전체의 신뢰도 상한**이다.
+
+### 정규화 기준점
+
+`bk_env.py --bench` (320×320, 64spp, GPU 1장):
+
+```
+Bench : cold 1.23 s  warm 0.68 s
+```
+
+다른 머신에서 이 값의 배율만 확인하면
+GPU 1장 렌더 시간 = 4.51 s × (내 warm / 0.68) 으로 추정된다.
+
+### 3세대 (2026-10 후속) — 커버리지 공백 스캔
+
+"GPU 가속으로 렌더를 빠르게 하는 모든 축이 다뤄졌는가" 를 스캔해서
+빈 축을 찾아 측정한 결과. **새로 실측한 것:**
+
+| 축 | 결과 |
+|---|---|
+| **SUBSURF `render_levels`** | 5→1: 30M→119K 정점, **17.46→6.24 s (−64%)** |
+| **Decimate COLLAPSE** | **역효과 — 3.26→11.03 s (3.4배 느림).** 정점 ↓ 시간 ↑↑ |
+| **Decimate UNSUBDIV** | **2.42 s — 가장 빠름 (COLLAPSE 대비 4.6배).** 이걸 써야 한다 |
+| `use_light_tree` (30조명, 64spp) | **무효과** (0.94 vs 0.90 s) |
+| `denoising_quality` F/B/H | **무효과** (0.81/0.80/0.82 s) |
+| 모션블러 ON | +8% (저렴) |
+| 출력 포맷 PNG/JPEG/EXR | **무효과** (0.84~0.92 s). 파일 크기가 관건 |
+| EXR `color_depth` | **'16'/'32' 만** — `'8'` 은 TypeError |
+| **Path Guiding GPU 무지원** | **실증** — GPU 무변화(+3%), CPU 는 +56% 느려짐 |
+| `kernel_optimization_level` | **차이 없음** (0.87/0.87/0.92 s). prefs 속성 |
+| **CPU vs GPU 픽셀 차이** | **691,200 px 중 2개만 상이**, Δmean_luma=0.000000 |
+| VRAM 스필 경계 | 3,250만 정점 + 4K + texture_limit=512 → **스필 미발생** |
+
+이 중 **Decimate COLLAPSE 역효과**와 **Path Guiding 실증**,
+**kernel_optimization_level 위치 오류** 는 문서에 없던 발견이다.
+
+> **Decimate COLLAPSE 역효과가 이 스캔에서 가장 값진 발견이었다.**
+> "정점 줄이면 빨라진다" 는 당연한 기대를 정면으로 뒤집는다.
+> COLLAPSE 는 삼각형을 재구성해서 BVH 를 비싸게 만들고, 그 비용이
+> 정점 감소분보다 훨씬 크다. UNSUBDIV 가 맞다.
+
+### 4세대 (2026-10) — 2K 60fps 실전 렌더 검증
+
+사용자 요청으로 **실제 1920×1080 / 60fps 영상**을 만들어 최적화 수치를 검증했다.
+씬: 절차적 셰이더 바닥 + 금속/디퓨즈 구 24개 (SUBSURF 3) + AREA 6 + SUN +
+카메라 dolly·pan, 구들 상승/하강 애니메이션.
+
+#### 60프레임 실측
+
+| 설정 | 총 시간 | 프레임당 |
+|---|---:|---:|
+| 최종 (persistent + denoise, 64spp) | **160.80 s** | 2.680 s |
+| 탐색 (persistent, denoise OFF, 16spp) | **70.46 s** | 1.174 s |
+
+#### 960×720 과 비교 — 비율이 고해상도에서도 유지됨
+
+| 항목 | 960×720 | **2K 60fps** |
+|---|---:|---:|
+| `use_persistent_data` OFF→ON | −50% | **−48%** (55.78→28.77 s) |
+| 디노이즈 ON→OFF | −25% | **−19%** (28.43→23.03 s) |
+
+#### ⚠ 강한 부하 하에서도 최적화 비율 유지
+
+**load 62 (80코어의 78%) + GPU 6장 전부 점유:**
+
+| 항목 | 부하 없음 | 강한 부하 | 판정 |
+|---|---:|---:|---|
+| persistent ON | 28.77 s | 28.43/28.57/29.13/29.57 s | **편차 3.9%** |
+| persistent OFF | 55.78 s | 55.28 s | **−48% 유지** |
+| denoise OFF | 23.03 s | 23.03 s | **−19% 유지** |
+
+**이유**: 두 최적화는 GPU 연산량이 아니라 **BVH 재구성 + 후처리 비용**을 줄인다.
+
+#### 🔥 카드 선택이 성능을 바꾼다
+
+같은 10프레임이 **29 s → 64.9 s** 로 변한 이유:
+
+```
+[GPU 사용] NVIDIA GeForce RTX 5060 Ti  여유 16281 MB  util   0%
+[GPU 제외] NVIDIA GeForce RTX 4070     여유  3914 MB  util 100%
+[GPU 제외] NVIDIA GeForce RTX 4060 Ti  여유  6273 MB  util 100%  ×2
+[GPU 제외] NVIDIA GeForce RTX 3060 Ti  여유  5937 MB  util 100%
+[GPU 제외] NVIDIA GeForce RTX 3070     여유  8138 MB  util   0%
+```
+
+6장 중 4장이 100% 점유 중인데도 실패하지 않고 util 0% 카드로 전환했다.
+**여유 VRAM 16281 MB (최다) 선택** — §1.7 해법의 실환경 증명.
+
+| 조건 | 프레임당 | 무부하 대비 |
+|---|---:|---:|
+| 부하 없음 | 2.68 s | 기준 |
+| GPU 6장 점유 | 6.49 s | +142% |
+| 여유 카드 1장뿐 | **28.13 s** | **+949%** |
+
+#### ⚠ 내가가설했다가 틀린 것 — util 0% = 빠르다 는 가정
+
+6장 점유 시 5060 Ti가 7.21 s 로 느려 util 0% 인데도 느릴 수 있다고 생각했다.
+**반복 측정으로 뒤집혔다:**
+
+| 카드 | 반복 warm | 결론 |
+|---|---|---|
+| RTX 5060 Ti | 7.21 → 4.14 → **2.68 s** | 첫 값은 잔여 부하였음 |
+| RTX 4060 Ti | 5.37 → 3.84 → 3.80 s | 안정 |
+| RTX 3070 | 8.17 s | |
+
+→ **"enable_gpu 가 가장 느린 카드를 고른다" 는 가설이 틀렸음.**
+여유 VRAM 최다 선택이 이 머신에서는 올바르다. **1회 측정 금지.**
+
+#### 산출물 검증
+
+```
+$ ffprobe final_60fps.mp4
+codec_name=h264  width=1920  height=1080  r_frame_rate=60/1
+nb_frames=60     duration=1.000000      748 KB
+```
+프레임 간 차이 1↔30 = 97,707 px, 1↔60 = 124,468 px (애니메이션 정상).
+PNG 시퀀스 60장 = 195 MB → H.264 합치기 성공.
+
+#### 이 과정에서 발견한 Blender 함정
+
+`bpy.ops.object.camera_add()` 는 **`scene.camera` 를 설정하지 않는다.**
+후속 `primitive_*_add` 가 컨텍스트를 빼앗으면 카메라 없이 렌더된다 →
+`Error: Cannot render, no camera`. 반드시 `sc.camera = bpy.context.object` 대입.
+(부하 생성 스크립트 2개가 이걸로 죽었다.)
+
+### 남은 한계 (솔직한 기록)
+
+- 전부 **960×720 기준**. 4K 에서 비율이 달라진다 (고해상도일수록 디노이즈
+  상대 비용은 줄고, BVH 비용 비율은 오른다).
+- CUDA/AMD/Metal 백엔드 미측정.
+- 클라우드 GPU 미측정 (PCIe 성능이 로컬과 다름).
+- 위 수치에는 이 머신의 부하(19~34%)가 이미 들어 있다.
+  조용한 머신에서는 더 빠를 것이다.
+
+## 2026-10 렌더 엔진 (EEVEE/Cycles/Workbench) — 실측 결과
+
+### 왜 열었나
+
+이 스킬은 Cycles 에 집중되어 있었다. EEVEE 는 "GPU 없는 머신에서 llvmpipe 로
+100배 느리다" 는 **오래된 측정 한 줄**만 남아 있었고, **엔진 선택 기준 자체가 없었다.**
+사용자가 EEVEE 도 쓸 수 있냐고 물었으니 제대로 재서 보기로 했다.
+
+### 추가 파일
+
+| 파일 | 하는 일 |
+|---|---|
+| `references/19-render-engines.md` | 엔진 선택 + 실측 매트릭스 + 설정 |
+| `compat.set_engine_for_purpose()` | purpose 로 엔진 자동 선택 |
+| `compat.eevee_gpu_renderer()` | EEVEE 가 어느 GPU 를 타는지 |
+| `compat.eevee_is_software()` | llvmpipe 폴백 감지 |
+| `scene_builder_template.py --purpose` | 구조/탐색/영상/최종 자동 분기 |
+
+### 핵심 발견
+
+**1. EEVEE 와 Cycles 는 서로 다른 GPU 에서 돈다**
+
+```
+EEVEE   : gpu.platform.renderer_get()
+          → AMD Radeon RX 7600 XT (radeonsi, navi33)      ← OpenGL
+Cycles  : gpu_report()
+          → NVIDIA GeForce RTX 4070                      ← OptiX
+```
+
+같은 머신인데 **완전히 다른 카드**. EEVEE 는 Blender GPU 모듈(OpenGL),
+Cycles 는 Compute API(OptiX)를 쓴다. 머신에 두 벌의 드라이버가 필요하다.
+
+**2. 속도 격차 7배 vs 샘플 격차 100배**
+
+| 씬 | Workbench | EEVEE | Cycles |
+|---|---:|---:|---:|
+| mixed | 2.62 s | 3.06 s | **0.30 s** |
+| reflective | **0.09 s** | 0.47 s | 0.67 s |
+| interior | **0.09 s** | 0.44 s | 0.33 s |
+
+→ **"렌더가 느려요" 의 원인은 엔진이 아니라 샘플 수다.**
+
+**3. 반복 렌더에서는 Cycles 가 10배 (cold vs warm)**
+
+| 엔진 | cold | warm | 감소 |
+|---|---:|---:|---:|
+| EEVEE (mixed) | 3.50 s | 3.06 s | −13% |
+| **Cycles (mixed)** | **4.91 s** | **0.30 s** | **−94%** |
+
+→ 1~3회면 EEVEE(cold 가 싸다), 4회 이상이면 Cycles(warm 이 10배 싸다).
+
+**4. 샘플 스케일링 방식이 다르다**
+
+| 샘플 | EEVEE | Cycles |
+|---|---:|---:|
+| 16 | 0.25 s | 0.81 s |
+| 64 | 0.46 s | 0.98 s |
+| 256 | 1.70 s | 1.65 s |
+
+→ EEVEE 는 **선형**(6.8배), Cycles 는 **거의 평탄**(2배, 적응형+디노이즈).
+→ 고품질은 Cycles 가 싸다.
+
+**5. EEVEE 는 계산 안 하는 게 있다 (품질 문제)**
+
+거울+유리 씬, `mean_luma`: EEVEE RT off 0.1161 / RT on 0.1281 / Cycles 0.1849.
+유리 굴절·거울 반사·GI 가 근사밖에 안 된다. **어두운 게 아니라 계산을 안 한 것.**
+
+**6. `BLENDER_EEVEE_NEXT` 는 5.x 에서 거부된다**
+
+4.x 튜토리얼을 그대로 따라가면 엔진이 안 바뀐다. 5.x 는 `BLENDER_EEVEE`.
+
+### 보조 발견 — persistent_data 반복 렌더 13.7배
+
+같은 씬 5회 반복 렌더:
+```
+persistent_data=False : 5.57 → 3.93 → 3.73 → 3.80 → 3.85  (warm 3.83 s)
+persistent_data=True  : 4.91 → 0.29 → 0.27 → 0.27 → 0.29  (warm 0.28 s)
+```
+앞선 영상 측정(−50%)보다 훨씬 크다. **정지이미지 반복 최적화에서는 더 큰 효과.**
+
+### 3세대 (2026-10 후속) — 커버리지 공백 스캔
+
+"GPU 가속으로 렌더를 빠르게 하는 모든 축이 다뤄졌는가" 를 스캔해서
+빈 축을 찾아 측정한 결과. **새로 실측한 것:**
+
+| 축 | 결과 |
+|---|---|
+| **SUBSURF `render_levels`** | 5→1: 30M→119K 정점, **17.46→6.24 s (−64%)** |
+| **Decimate COLLAPSE** | **역효과 — 3.26→11.03 s (3.4배 느림).** 정점 ↓ 시간 ↑↑ |
+| **Decimate UNSUBDIV** | **2.42 s — 가장 빠름 (COLLAPSE 대비 4.6배).** 이걸 써야 한다 |
+| `use_light_tree` (30조명, 64spp) | **무효과** (0.94 vs 0.90 s) |
+| `denoising_quality` F/B/H | **무효과** (0.81/0.80/0.82 s) |
+| 모션블러 ON | +8% (저렴) |
+| 출력 포맷 PNG/JPEG/EXR | **무효과** (0.84~0.92 s). 파일 크기가 관건 |
+| EXR `color_depth` | **'16'/'32' 만** — `'8'` 은 TypeError |
+| **Path Guiding GPU 무지원** | **실증** — GPU 무변화(+3%), CPU 는 +56% 느려짐 |
+| `kernel_optimization_level` | **차이 없음** (0.87/0.87/0.92 s). prefs 속성 |
+| **CPU vs GPU 픽셀 차이** | **691,200 px 중 2개만 상이**, Δmean_luma=0.000000 |
+| VRAM 스필 경계 | 3,250만 정점 + 4K + texture_limit=512 → **스필 미발생** |
+
+이 중 **Decimate COLLAPSE 역효과**와 **Path Guiding 실증**,
+**kernel_optimization_level 위치 오류** 는 문서에 없던 발견이다.
+
+> **Decimate COLLAPSE 역효과가 이 스캔에서 가장 값진 발견이었다.**
+> "정점 줄이면 빨라진다" 는 당연한 기대를 정면으로 뒤집는다.
+> COLLAPSE 는 삼각형을 재구성해서 BVH 를 비싸게 만들고, 그 비용이
+> 정점 감소분보다 훨씬 크다. UNSUBDIV 가 맞다.
+
+### 남은 한계
+
+- **EEVEE Vulkan 백엔드 — 측정 완료.** ❓ 아님 (이견 있음).
+  `--gpu-backend vulkan` 로 9개 기기(AMD2+NVIDIA6+llvmpipe) 전부 노출되고,
+  EEVEE 를 RTX 4070(Vulkan dev 5)에서 돌리면 reflective 씬 0.51 s → 0.28 s (1.8배).
+  llvmpipe 강제 시 3.84 s (cold 29.31 s). **대신 `--gpu-device` 인덱스가
+  nvidia-smi 카드와 매칭되지 않아 자동 선택은 구현했다가 되돌렸다**
+  (후보가 여럿이면 None 반환). 자세한 내용은 §19 §2.5 참조.
+- CUDA/OptiX 아닌 백엔드, Metal, volumetrics, 모션블러/DOF 미측정.
+- 4.x EEVEE Legacy 경계만 확인 (Engine ID 변경 사실만).
+- GPU 없는 머신의 EEVEE 는 재측정 안 함. 다만 llvmpipe 강제 렌더는
+  이 머신에서 측정했다 (reflective 3.84 s warm / 29.31 s cold).
+
 ## Verification log
 
 | 항목 | 결과 |
@@ -317,3 +752,25 @@ T6 이 아무것도 못 찾지 못했으면 이 테스트는 실패였을 것이
 | `PoseBone.evaluated_get` 부재 확인 | PASS — `AttributeError` |
 | `parent_set(ARMATURE_AUTO)` T1 증거 확인 | PASS — 정점그룹 가중치 0.09~0.95 (T1 증거 채택) |
 | GN depsgraph 재평가 주장 | **FAIL — 재현 안 됨.** 문서에 넣지 않음 |
+| GPU 세그폴트 (exit 139) 재현 → 수정 → 재검증 | PASS — bisect로 원인 특정, 순서 고정 후 exit 0 |
+| GPU 무차별 활성화 OOM 재현 → 수정 → 재검증 | PASS — 3장 정확히 제외, 렌더 4.22 s |
+| GPU 1/2/3/6장 스케일링 측정 | PASS — 4.51 / 5.26 / 6.17 / OOM |
+| 디노이즈·타일·persistent_data 비용 측정 | PASS — −25% / −5% / −5% |
+| 템플릿 GPU 경로 end-to-end | PASS — `[GPU 사용] 1장: RTX 4070`, 씬검증 ok, luma 0.344 |
+| 엔진 4개 대입 (5.2) | `scene.render.engine` | PASS — **EEVEE_NEXT 거부**, EEVEE/CYCLES/WORKBENCH OK |
+| EEVEE GPU 백엔드 확인 | `gpu.init()` | PASS — **AMD RX 7600 XT / OpenGL** (Cycles 는 RTX 4070 / OptiX) |
+| 엔진 × 씬 3×3 매트릭스 | 960×720 64spp pd=True | PASS — 9개 조합 전부 측정 |
+| EEVEE RT on/off 품질 차이 | reflective | PASS — luma 0.1161 → 0.1281 (Cycles 목표 0.1849) |
+| EEVEE 샘플 스케일 | 16/64/256 | PASS — 0.25/0.46/1.70 s (선형) |
+| Cycles 샘플 스케일 | 16/64/256 | PASS — 0.81/0.98/1.65 s (평탄) |
+| 엔진별 cold vs warm | 4회 반복 | PASS — Cycles −94%, EEVEE −13% |
+| `set_engine_for_purpose()` 4종 | compat 헬퍼 | PASS — structure/explore/animate/final 전부 OK |
+| 템플릿 `--purpose` 4종 | end-to-end | PASS — 전부 렌더 + imagecheck ok |
+| 템플릿 기존 플래그 호환 | --engine/--cpu/--quality | PASS — 6개 조합 전부 exit 0 |
+| `persistent_data` 반복 렌더 | mixed, Cycles 5회 | PASS — **3.83 → 0.28 s (13.7배)** |
+| **2K 60fps 60프레임 실제 렌더** | Cycles GPU1 + OptiX | PASS — 최종 160.80 s / 탐색 70.46 s |
+| **2K 최적화 비율 검증** | 10프레임 비교 | PASS — persistent **−48%**, denoise **−19%** (960×720과 일치) |
+| **강한 부하 (load 62 + GPU 6장)** | 10프레임 반복 | PASS — **최적화 비율 유지**, 편차 3.9% |
+| **카드 선택 실전 검증** | 6장 중 4장 100% 점유 | PASS — util 0% 카드로 자동 전환, **29 s → 64.9 s 차이 확인** |
+| **2K 60fps mp4 산출물** | `ffprobe` | PASS — h264 1920×1080 60/1 fps 60프레임 748 KB |
+| `camera_add()` → `scene.camera` 미설정 | 부하 스크립트 2개 실패 | PASS — **함정 발견. 명시적 대입 필요** |

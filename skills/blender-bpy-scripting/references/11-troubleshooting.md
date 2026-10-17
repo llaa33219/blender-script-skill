@@ -331,6 +331,9 @@ print([m.name for m in obj.modifiers])          # ['Sub', 'Bool']
 | 3 | 머티리얼이 완전 투명으로 렌더 | BSDF가 출력 노드에 미연결 | `MAT_SURFACE_UNLINKED` (§2.5) |
 | 4 | 소켓에 값을 넣었는데 반영이 안 됨 | 소켓 이름이 5.x 에서 개명됨 | `introspect.set_input()` 반환값 확인 (§2.6) |
 | 5 | **GPU 지정했는데 CPU 로 렌더됨** | `compute_device_type` 대입은 성공, 하드웨어 없음 | `bkkit.compat.gpu_report()` (§2.6.5, `14-` §1) |
+| 5b | **`System is out of GPU memory`** | 보이는 GPU 를 전부 켰는데 그중 몇 장은 남의 카드 | `compat.enable_gpu()` — 남은 VRAM 필터 (§2.9.4, `14-` §1.7) |
+| 5c | **GPU 설정만 하면 프로세스째 죽음 (exit 139)** | `refresh_devices()` 를 `compute_device_type` 대입 전에 호출 | 순서 뒤집기 (§2.9.5, `14-` §1.6) |
+| 5d | **GPU를 늘렸더니 렌더가 더 느려짐** | NVLink 없음 — PCIe 동기화 비용 > 추가 연산 | `enable_gpu(max_devices=1)` (§2.9.6, `14-` §1.8) |
 | 6 | **프로시저럴 머티리얼이 내보내기 후 전부 같은 회색** | 링크된 소켓이 `default_value` 로 방출됨 | **가장 조용하고 가장 파괴적.** 노드 트리 필수. 스킬에 경고 없음 |
 | 7 | **컴포지터가 프로세스째 죽음** | 헤드리스에 `libEGL.so.1` 없음 | `apt-get install -y libegl1 libegl-mesa0` — **5분짜리 렌더가 통째로 소멸** |
 | 8 | **컴포지터에서 `ColorCorrection` 썼더니 프레임 전체가 검게 죽음** | `Master Contrast` 가 0.5 피벗 연산 | 값을 1.0 근처로. 작은 배경값이 음수가 됨 |
@@ -370,6 +373,102 @@ blender -b -P scripts/bk.py -- api reach <idname>  # 3. 그 오퍼레이터가 �
 그래서 그것들은 산출물 자체의 수치를 재야 한다.
 
 ---
+
+### 2.9.3 GPU 는 세 가지로 조용히 죽는다 (6 GPU 머신에서 실측)
+
+| 증상 | 눈으로 보이는가 | 진짜 원인 |
+|---|---|---|
+| `render()` → `{'FINISHED}`, 파일도 생김 | **아무 이상 없음** | GPU 없음 → CPU 로 렌더됨 |
+| `System is out of GPU memory` | 예외로 보임 | GPU 있으나 그 카드가 **남의 것** |
+| 프로세스째 죽음 (`exit 139`) | 크래시 파일만 남음 | `refresh_devices()` 호출 순서 |
+
+세 번째는 `try/except` 로 못 잡는다. **세그폴트는 프로세스 종료**라.
+Python 레벨 예외 처리가 아무 소용 없다. 이 스킬의 `gpu_report()` 가 실제로
+이 버그를 갖고 있어서 GPU 머신 첫 실행에서 죽었다.
+
+### 2.9.4 `System is out of GPU memory` — 카드가 보이는데 쓸 수 없다
+
+```python
+# frag  (prefs 는 앞선 블록에서 온다고 가정)
+for d in prefs.devices:
+    d.use = True          # ❌ 무차별
+```
+```
+RuntimeError: Error: System is out of GPU memory
+```
+
+`refresh_devices()` 는 CUDA/OPTIX/**HIP까지 전 백엔드**를 채워 넣고,
+Cycles 는 "보이는 카드"와 "남은 VRAM"을 구분하지 않는다.
+
+**진짜 무서운 지점**: `bk doctor` 의 `활성 GPU 수`가 **6**이었다.
+6장 중 3장은 다른 프로그램이 100% 붙잡고 있었고, 빈 카드가 3장 더 있었는데도
+파일이 터졌다. **"활성 GPU 수" 는 내가 잡은 카드가 아니라
+Cycles 가 잡았다고 믿는 카드 수**다. 남은 VRAM 을 직접 보기 전까진
+GPU가 걸렸다고 결론 내릴 수 없다.
+
+```python
+# frag  (여기서 compat 는 이미 import 된 상태라고 가정)
+# ✅ 고치는 방법 — compat.enable_gpu() 가 내장하고 있다
+from bkkit import compat
+ok, info = compat.enable_gpu(verbose=True)
+#   [GPU 사용] NVIDIA GeForce RTX 4070  여유 12252 MB
+#   [GPU 제외] NVIDIA GeForce RTX 3070  여유 1263 MB  (여유 VRAM 1263 MB < 2000 MB (다른 작업 중))
+```
+
+수동으로 한다면 Cycles 디바이스 ID 의 PCI bus id 를 `nvidia-smi` 에 매칭한다:
+
+```python
+# frag
+import re, subprocess
+def bus_id(dev_id):
+    m = re.search(r"0000:([0-9a-fA-F]{2}:[0-9a-fA-F]{2})", dev_id or "")
+    return m.group(1).lower() if m else None
+# 'CUDA_NVIDIA GeForce RTX 4070_0000:82:00_OptiX' -> '82:00'
+```
+
+> ⚠ **총 VRAM 으로 정렬하면 더 망한다.** 여유 9032 MB 인 16 GB 카드가
+> 여유 8159 MB 인 8 GB 카드보다 먼저 선택되는 식. **여유량**으로 골라라.
+
+### 2.9.5 `exit 139` — 순서를 뒤집으면 죽는다
+
+```python
+# frag  (prefs 는 앞선 블록에서 온다고 가정)
+prefs.refresh_devices()                      # ❌ 먼저 부르면 여기서 RNA 가 깨진다
+out["num_gpu"] = prefs.get_num_gpu_devices()
+# AttributeError: 'CyclesPreferences' object has no attribute 'compute_device_type'
+# ... 이후 렌더 시 SIGSEGV
+```
+
+```python
+# frag  (prefs 는 앞선 블록에서 온다고 가정)
+prefs.compute_device_type = "OPTIX"          # ✅ 먼저 설정
+prefs.refresh_devices()                      #    그 다음 조회
+```
+
+`refresh_devices()` 는 5개 백엔드를 전부 재질의해 `prefs.devices` 를
+다시 채운다. 그 과정에서 preferences RNA 가 반쯤 만들어진 상태로 남는다.
+
+> **리팩터링 체크리스트**: `prefs` 를 만지는 코드를 고치면
+> `echo $?` 로 139 를 확인하라. `try/except` 는 이걸 잡지 못한다.
+
+### 2.9.6 GPU 를 늘렸더니 느려졌다
+
+960x720 · 64 spp 실측 (GPU 렌더, OptiX 디노이즈 ON):
+
+| 구성 | 시간 |
+|---|---:|
+| CPU (80코어) | 5.69 s |
+| **GPU 1장** | **4.51 s** ← 가장 빠름 |
+| GPU 2장 | 5.26 s |
+| GPU 3장 | 6.17 s |
+| GPU 6장 | *OOM 실패* |
+
+NVLink 없는 카드는 타일마다 씬 전체를 각 카드에 복사하고 결과를
+PCIe 로 동기화한다. 그 비용이 추가 연산량보다 크다.
+
+→ `enable_gpu(max_devices=1)` 이 기본값. 여러 장이 필요한 유일한 경우는
+**VRAM 이 벽일 때** (단일 카드에 씬이 안 들어갈 때) 다.
+
 
 ## 3. 프로세스 자체가 죽는 경우
 

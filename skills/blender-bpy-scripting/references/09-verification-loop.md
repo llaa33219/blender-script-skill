@@ -113,6 +113,7 @@ blender -b -P scripts/bk.py -- render out.png
 빠르게 반복할 때는 이렇게:
 
 ```python
+# frag  (sys.path 는 환경에 맞게 바꿔야 한다)
 import bpy, sys
 sys.path.insert(0, "/path/to/blender-bpy-scripting/scripts")
 from bkkit import compat
@@ -121,18 +122,65 @@ compat.set_engine(bpy.context.scene, "CYCLES")     # 축소 해상도
 scene = bpy.context.scene
 scene.render.resolution_x, scene.render.resolution_y = 320, 240
 scene.cycles.samples = 32                                        # 낮은 샘플
-scene.cycles.use_denoising = True                                 # 노이즈 억제
 scene.cycles.use_adaptive_sampling = True
 scene.cycles.adaptive_threshold = 0.05
-print("준비:", scene.render.resolution_x, scene.cycles.samples, scene.cycles.use_denoising)
+
+# GPU 는 예외 없이 이 한 줄로 켠다. 없으면 CPU 로 내려가고 이유를 알려준다.
+ok, info = compat.enable_gpu(scene, max_devices=1)
+print("GPU:", info.get("num_gpu_devices"), info.get("selected") or info.get("reason"))
+print("준비:", scene.render.resolution_x, scene.cycles.samples)
 ```
 
-실측 성능 (이 샌드박스, CPU only): 320×240 @ 48spp ≈ **17초**.
+#### ⭐ GPU 는 절대 `scene.cycles.device = "GPU"` 로 직접 켜지 마라
+
+이 스킬이 GPU 없이 쓰이던 시절에는 `device = "GPU"` 대입이 조용히 실패했다
+(§ `14-gpu-rendering.md` §1). **GPU가 있는 머신에서는 더 나빠진다** — 카드가
+남의 것이라 `System is out of GPU memory` 로 죽고, GPU 없으면 조용히 CPU로 렌더된다.
+
+`compat.enable_gpu()` 가 하는 일:
+
+1. `compute_device_type` **먼저** 설정 후 `refresh_devices()` — 반대 순서는 **SIGSEGV**
+2. 선택 백엔드의 카드만 남김 (AMD 카드가 섞여 있어도 걸러짐)
+3. `nvidia-smi` 로 **남은 VRAM 2 GB 미만 카드 제외**
+4. **여유 VRAM 내림차순** → 기본 **1장만**
+5. GPU 없으면 CPU 폴백 + `info["reason"]`
+
+실측 (6 NVIDIA + 2 AMD 머신, 960×720, 64 spp, OptiX 디노이즈 ON):
+
+| 구성 | 시간 |
+|---|---:|
+| CPU (80코어) | 5.69 s |
+| **GPU 1장** | **4.51 s** |
+| GPU 2장 | 5.26 s |
+| GPU 3장 | 6.17 s |
+| GPU 6장 | *out of GPU memory* |
+
+> **GPU 를 늘리면 느려진다.** NVLink 없으면 타일마다 씬을 복사하고
+> 결과를 PCIe 로 동기화하는데 그 비용이 추가 연산량보다 크다.
+> `enable_gpu(max_devices=1)` 이 기본값인 이유다. 여러 장이 필요한 경우는
+> **VRAM 이 벽일 때** 뿐이다.
+
+#### 📌 렌더 시간은 반드시 재라 — GPU 적용의 유일한 증거
+
+`scenecheck` 가 통과하고 `render()` 가 `{'FINISHED'}` 를 반환하고 파일도 생겼다고
+해서 GPU 로 렌더된 것은 아니다. GPU 없으면 **조용히 CPU로 렌더**된다
+(`mean_luma` 까지 정상). 그러므로:
+
+```python
+# frag  (앞선 단계에서 만든 씬의 scene/info 를 쓴다)
+import time
+t0 = time.time()
+bpy.ops.render.render(write_still=True)
+dt = time.time() - t0
+print(f"렌더 {dt:.2f}s  device={scene.cycles.device}  gpu={info.get('num_gpu_devices')}")
+```
+
+실측 성능 (CPU only 머신): 320×240 @ 48spp ≈ **17초**.
 960×720 @ 128spp 로 올리는 것은 1~2배가 아니라 10배 이상이다. 루프 중에는 무리하지 마라.
 
-> **EEVEE 주의**: 헤드리스 서버에는 GPU 가 없다. EEVEE 는 소프트웨어 EGL(llvmpipe)로
+> **EEVEE 주의**: GPU 없는 헤드리스 서버에서 EEVEE 는 소프트웨어 EGL(llvmpipe)로
 > 떨어져서 **약 100배 느렸다** (64×64 에 113초 vs Cycles CPU 96×96 에 0.96초).
-> **반복 루프에서는 Cycles CPU 를 써라.**
+> GPU 없는 머신에서는 **반복 루프에 Cycles CPU 를 써라.**
 
 ### 단계 4 — MEASURE (이게 진짜 검증)
 

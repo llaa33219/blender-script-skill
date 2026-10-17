@@ -156,23 +156,50 @@ def build_scene():
 # 3. 렌더 설정
 # --------------------------------------------------------------------------
 
-def setup_render(scene, path, samples=64, res=(640, 480), engine="CYCLES"):
+def setup_render(scene, path, samples=64, res=(640, 480), engine="CYCLES",
+                 use_gpu=True, quality="balanced", max_devices=None):
     """렌더 엔진과 출력 설정.
 
     ``compat.set_engine`` 이 Cycles 애드온을 자동으로 활성화하므로
     ``--factory-startup`` 에서도 동작한다.
+
+    ``use_gpu=True`` 면 ``compat.enable_gpu()`` 로 GPU를 켜되, **사용 가능한
+    GPU가 없거나 VRAM이 부족하면 예외 없이 CPU로 내려간다.** 직접
+    ``device = "GPU"`` 를 대입하는 것의 최대 문제는 정확히 그 "조용한 폴백"
+    때문이다 -- 6장 GPU 머신에서 점유 중인 카드를 잡으면
+    ``System is out of GPU memory`` 로 죽는다.
+
+    quality: "fast" (디노이즈 끔, 실측 -25%) / "balanced" (기본)
     """
     compat.set_engine(scene, engine)
     if scene.render.engine == "CYCLES":
-        scene.cycles.device = "CPU"      # GPU 없을 때 명시
+        gpu_info = None
+        if use_gpu:
+            ok, gpu_info = compat.enable_gpu(scene, max_devices=max_devices)
+            if not ok:
+                print(f"[GPU 폴백] {gpu_info.get('reason')}")
+                scene.cycles.device = "CPU"
+            else:
+                sel = ", ".join(s["name"] for s in gpu_info.get("selected", []))
+                print(f"[GPU 사용] {gpu_info['num_gpu_devices']}장: {sel} "
+                      f"denoiser={gpu_info.get('denoiser')}")
+        else:
+            scene.cycles.device = "CPU"      # GPU 없이 강제
         scene.cycles.samples = samples
-        scene.cycles.use_denoising = True
         scene.cycles.use_adaptive_sampling = True
         scene.cycles.adaptive_threshold = 0.02
         scene.cycles.seed = 1234           # 재현성
+        if scene.render.engine == "CYCLES":
+            compat.gpu_speed_preset(scene, quality=quality)
     else:
         scene.eevee.taa_render_samples = samples
 
+    setup_output(scene, path, res)
+    return scene
+
+
+def setup_output(scene, path, res=(640, 480)):
+    """출력 포맷·해상도·컬러 매니지먼트. 엔진 설정과 독립적이다."""
     scene.render.resolution_x, scene.render.resolution_y = res
     scene.render.resolution_percentage = 100
     scene.render.film_transparent = False
@@ -197,7 +224,18 @@ def parse_args(argv):
     p.add_argument("--samples", type=int, default=64)
     p.add_argument("--width", type=int, default=640)
     p.add_argument("--height", type=int, default=480)
-    p.add_argument("--engine", default="CYCLES")
+    p.add_argument("--engine", default=None,
+                   help="BLENDER_WORKBENCH | BLENDER_EEVEE | CYCLES "
+                        "(기본: --purpose 로 자동 선택)")
+    p.add_argument("--purpose", default="final",
+                   choices=["structure", "explore", "animate", "final"],
+                   help="structure=Workbench 클레이 / explore=EEVEE 탐색 / "
+                        "animate·final=Cycles (엔진 자동 선택)")
+    p.add_argument("--cpu", action="store_true", help="GPU 무시하고 CPU 로 렌더")
+    p.add_argument("--quality", default="balanced", choices=["fast", "balanced", "quality"],
+                   help="fast = 디노이즈 off (실측 -25%%)")
+    p.add_argument("--gpu-count", type=int, default=None,
+                   help="사용할 GPU 장수 (기본 1). NVLink 없는 카드에서 늘리면 느려진다")
     p.add_argument("--force", action="store_true",
                    help="씬 검증이 실패해도 렌더한다")
     known, _ = p.parse_known_args(argv)
@@ -208,7 +246,30 @@ def main():
     args = parse_args(script_argv())
 
     scene = build_scene()
-    setup_render(scene, args.out, args.samples, (args.width, args.height), args.engine)
+    if args.engine:
+        # 엔진이 명시되면 그대로 사용
+        compat.set_engine(scene, args.engine)
+        setup_render(scene, args.out, args.samples, (args.width, args.height),
+                     args.engine, use_gpu=not args.cpu, quality=args.quality,
+                     max_devices=args.gpu_count)
+    else:
+        # 엔진 자동 선택 — purpose 로 판단 (references/19-render-engines.md)
+        chosen = compat.set_engine_for_purpose(scene, args.purpose,
+                                               samples=args.samples)
+        print(f"[엔진 선택] {chosen['engine']} "
+              f"({args.purpose}) {chosen.get('note') or ''}")
+        if chosen["engine"] == "CYCLES" and chosen.get("gpu"):
+            print(f"[GPU 사용] {chosen['devices']}장  "
+                  f"denoiser={scene.cycles.denoiser}")
+        if chosen["engine"] != "CYCLES":
+            setup_render(scene, args.out, args.samples,
+                         (args.width, args.height), chosen["engine"],
+                         use_gpu=False)
+        else:
+            # 엔진 자동 선택이 이미 사이클스 설정을 했다.
+            # 여기서는 출력 관련 설정만 맞춘다 (setup_render 를 다시 돌리면
+            # samples/denoising 을 덮어쓴다).
+            setup_output(scene, args.out, (args.width, args.height))
 
     # --- 정적 검증: 실패하면 렌더하지 않는다 ---
     findings, summary = scenecheck.run()
